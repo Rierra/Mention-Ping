@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Reddit to Telegram Monitor Bot
-Monitors all of Reddit for specific keywords and sends notifications with content and links
+Monitors Reddit using search API for specific keywords and sends notifications
 """
 
 import os
@@ -46,11 +46,13 @@ class RedditTelegramBot:
         
         # Configuration
         self.check_interval = int(os.getenv('CHECK_INTERVAL', '300'))  # seconds
-        self.max_posts = int(os.getenv('MAX_POSTS', '100'))
+        self.search_limit = int(os.getenv('SEARCH_LIMIT', '50'))  # results per keyword
+        self.search_time_filter = os.getenv('SEARCH_TIME_FILTER', 'hour')  # hour, day, week, month, year, all
         
         # Data storage
         self.keywords: Set[str] = set()
         self.processed_posts: Set[str] = set()
+        self.last_search_time: Dict[str, float] = {}  # Track last search time per keyword
         self.data_file = 'bot_data.json'
         
         # Rate limiting for notifications
@@ -99,19 +101,20 @@ class RedditTelegramBot:
             raise
     
     def load_data(self):
-        """Load keywords and processed posts from file"""
+        """Load keywords, processed posts, and last search times from file"""
         try:
             if os.path.exists(self.data_file):
                 with open(self.data_file, 'r') as f:
                     data = json.load(f)
                     self.keywords = set(data.get('keywords', []))
                     self.processed_posts = set(data.get('processed_posts', []))
+                    self.last_search_time = data.get('last_search_time', {})
                     logger.info(f"Loaded {len(self.keywords)} keywords and {len(self.processed_posts)} processed posts")
         except Exception as e:
             logger.error(f"Error loading data: {e}")
     
     def save_data(self):
-        """Save keywords and processed posts to file"""
+        """Save keywords, processed posts, and last search times to file"""
         try:
             # Limit processed posts to last 10000 to prevent file from growing too large
             if len(self.processed_posts) > 10000:
@@ -119,26 +122,13 @@ class RedditTelegramBot:
                 
             data = {
                 'keywords': list(self.keywords),
-                'processed_posts': list(self.processed_posts)
+                'processed_posts': list(self.processed_posts),
+                'last_search_time': self.last_search_time
             }
             with open(self.data_file, 'w') as f:
                 json.dump(data, f, indent=2)
         except Exception as e:
             logger.error(f"Error saving data: {e}")
-    
-    def contains_keyword(self, text: str) -> List[str]:
-        """Check if text contains any monitored keywords"""
-        if not text:
-            return []
-        
-        text_lower = text.lower()
-        found_keywords = []
-        
-        for keyword in self.keywords:
-            if keyword in text_lower:
-                found_keywords.append(keyword)
-        
-        return found_keywords
     
     def clean_text_for_telegram(self, text: str) -> str:
         """Clean text for Telegram by removing/escaping problematic characters"""
@@ -164,16 +154,14 @@ class RedditTelegramBot:
         
         return text.strip()
     
-    def format_notification(self, item, found_keywords: List[str], item_type: str) -> str:
+    def format_notification(self, item, keyword: str, item_type: str) -> str:
         """Format notification message"""
-        keywords_str = ", ".join(found_keywords)
-        
         try:
             if item_type == "post":
                 title = item.title[:200] + "..." if len(item.title) > 200 else item.title
                 content = item.selftext[:500] + "..." if len(item.selftext) > 500 else item.selftext
                 
-                message = f"Keyword match: {keywords_str}\n\n"
+                message = f"Keyword match: {keyword}\n\n"
                 message += f"Post: {title}\n"
                 message += f"By: u/{item.author}\n"
                 message += f"Subreddit: r/{item.subreddit}\n"
@@ -186,7 +174,7 @@ class RedditTelegramBot:
             else:  # comment
                 content = item.body[:500] + "..." if len(item.body) > 500 else item.body
                 
-                message = f"Keyword match: {keywords_str}\n\n"
+                message = f"Keyword match: {keyword}\n\n"
                 message += f"Comment by: u/{item.author}\n"
                 message += f"Subreddit: r/{item.subreddit}\n"
                 message += f"\nComment:\n{content}\n"
@@ -194,7 +182,7 @@ class RedditTelegramBot:
                 
         except AttributeError as e:
             logger.error(f"Error formatting notification: {e}")
-            message = f"Keyword match: {keywords_str}\n\nError formatting item details."
+            message = f"Keyword match: {keyword}\n\nError formatting item details."
         
         return message
     
@@ -258,39 +246,36 @@ class RedditTelegramBot:
             logger.error(f"Error sending notification: {e}")
             raise
     
-    async def monitor_reddit(self):
-        """Monitor Reddit for keyword matches"""
-        if not self.keywords:
-            logger.info("No keywords to monitor")
-            return
-        
+    async def search_keyword(self, keyword: str):
+        """Search Reddit for a specific keyword"""
         try:
             if not self.reddit:
                 await self.setup_reddit()
-                
-            logger.info("Checking Reddit for keyword matches...")
             
-            # Monitor new posts from r/all with error handling
+            logger.info(f"Searching Reddit for keyword: {keyword}")
+            
+            subreddit = await self.reddit.subreddit('all')
+            results_found = 0
+            new_matches = 0
+            
+            # Search for posts
             try:
-                subreddit = await self.reddit.subreddit('all')
-                post_count = 0
-                
-                async for post in subreddit.new(limit=self.max_posts):
+                async for post in subreddit.search(
+                    keyword, 
+                    sort='new', 
+                    time_filter=self.search_time_filter, 
+                    limit=self.search_limit
+                ):
                     try:
+                        results_found += 1
+                        
                         if post.id in self.processed_posts:
                             continue
                         
-                        post_count += 1
-                        
-                        # Check post title and content
-                        found_keywords = []
-                        found_keywords.extend(self.contains_keyword(post.title))
-                        found_keywords.extend(self.contains_keyword(post.selftext))
-                        
-                        if found_keywords:
-                            message = self.format_notification(post, list(set(found_keywords)), "post")
-                            await self.send_notification(message)
-                            logger.info(f"Queued notification for post: {post.id}")
+                        new_matches += 1
+                        message = self.format_notification(post, keyword, "post")
+                        await self.send_notification(message)
+                        logger.info(f"Queued notification for post: {post.id}")
                         
                         self.processed_posts.add(post.id)
                         
@@ -298,32 +283,36 @@ class RedditTelegramBot:
                         await asyncio.sleep(0.1)
                         
                     except Exception as e:
-                        logger.error(f"Error processing post: {e}")
+                        logger.error(f"Error processing search result post: {e}")
                         continue
                 
-                logger.info(f"Processed {post_count} posts")
+                logger.info(f"Keyword '{keyword}': Found {results_found} posts, {new_matches} new")
                 
             except Exception as e:
-                logger.error(f"Error fetching posts: {e}")
+                logger.error(f"Error searching posts for keyword '{keyword}': {e}")
             
-            # Monitor new comments from r/all with error handling
+            # Search for comments
             try:
-                comment_count = 0
+                results_found = 0
+                new_matches = 0
                 
-                async for comment in subreddit.comments(limit=self.max_posts):
+                async for comment in subreddit.search(
+                    keyword,
+                    sort='new',
+                    time_filter=self.search_time_filter,
+                    limit=self.search_limit,
+                    params={'type': 'comment'}
+                ):
                     try:
+                        results_found += 1
+                        
                         if comment.id in self.processed_posts:
                             continue
                         
-                        comment_count += 1
-                        
-                        # Check comment content
-                        found_keywords = self.contains_keyword(comment.body)
-                        
-                        if found_keywords:
-                            message = self.format_notification(comment, found_keywords, "comment")
-                            await self.send_notification(message)
-                            logger.info(f"Queued notification for comment: {comment.id}")
+                        new_matches += 1
+                        message = self.format_notification(comment, keyword, "comment")
+                        await self.send_notification(message)
+                        logger.info(f"Queued notification for comment: {comment.id}")
                         
                         self.processed_posts.add(comment.id)
                         
@@ -331,18 +320,49 @@ class RedditTelegramBot:
                         await asyncio.sleep(0.1)
                         
                     except Exception as e:
-                        logger.error(f"Error processing comment: {e}")
+                        logger.error(f"Error processing search result comment: {e}")
                         continue
                 
-                logger.info(f"Processed {comment_count} comments")
+                logger.info(f"Keyword '{keyword}': Found {results_found} comments, {new_matches} new")
                 
             except Exception as e:
-                logger.error(f"Error fetching comments: {e}")
+                logger.error(f"Error searching comments for keyword '{keyword}': {e}")
+            
+            # Update last search time for this keyword
+            self.last_search_time[keyword] = time.time()
+            
+        except Exception as e:
+            logger.error(f"Error searching keyword '{keyword}': {e}")
+    
+    async def monitor_reddit(self):
+        """Monitor Reddit for keyword matches using search"""
+        if not self.keywords:
+            logger.info("No keywords to monitor")
+            return
+        
+        try:
+            if not self.reddit:
+                await self.setup_reddit()
+            
+            logger.info(f"Starting search for {len(self.keywords)} keywords...")
+            
+            for keyword in self.keywords:
+                try:
+                    await self.search_keyword(keyword)
+                    
+                    # Delay between keyword searches to respect rate limits
+                    await asyncio.sleep(2)
+                    
+                except Exception as e:
+                    logger.error(f"Error processing keyword '{keyword}': {e}")
+                    continue
             
             # Process any queued notifications
             await self.process_notifications()
             
             self.save_data()
+            
+            logger.info("Search cycle completed")
             
         except Exception as e:
             logger.error(f"Error monitoring Reddit: {e}")
@@ -384,6 +404,9 @@ class RedditTelegramBot:
             return
         
         self.keywords.remove(keyword)
+        # Remove last search time for this keyword
+        if keyword in self.last_search_time:
+            del self.last_search_time[keyword]
         self.save_data()
         await update.message.reply_text(f"Removed keyword: {keyword}")
         logger.info(f"Removed keyword: {keyword}")
@@ -402,6 +425,7 @@ class RedditTelegramBot:
         """Clear all monitored keywords"""
         count = len(self.keywords)
         self.keywords.clear()
+        self.last_search_time.clear()
         self.save_data()
         await update.message.reply_text(f"Cleared {count} keywords.")
         logger.info(f"Cleared {count} keywords")
@@ -412,7 +436,8 @@ class RedditTelegramBot:
         status_msg += f"Keywords monitored: {len(self.keywords)}\n"
         status_msg += f"Posts processed: {len(self.processed_posts)}\n"
         status_msg += f"Check interval: {self.check_interval} seconds\n"
-        status_msg += f"Max posts per check: {self.max_posts}\n"
+        status_msg += f"Search limit: {self.search_limit} per keyword\n"
+        status_msg += f"Search time filter: {self.search_time_filter}\n"
         status_msg += f"Reddit client: {'Active' if self.reddit else 'Not initialized'}\n"
         status_msg += f"Queued notifications: {len(self.pending_notifications)}"
         
@@ -431,7 +456,7 @@ Commands:
 /status - Show bot status
 /help - Show this help message
 
-The bot monitors all of Reddit for your keywords and sends notifications with the full content and links when matches are found.
+The bot searches all of Reddit for your keywords and sends notifications with the full content and links when matches are found.
         """
         await update.message.reply_text(help_text.strip())
     
