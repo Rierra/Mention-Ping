@@ -254,6 +254,10 @@ class RedditTelegramBot:
             
             logger.info(f"Searching Reddit for keyword: {keyword}")
             
+            # Wrap multi-word phrases in quotes for exact phrase matching
+            search_query = f'"{keyword}"' if ' ' in keyword else keyword
+            logger.info(f"Search query: {search_query}")
+            
             subreddit = await self.reddit.subreddit('all')
             results_found = 0
             new_matches = 0
@@ -261,7 +265,7 @@ class RedditTelegramBot:
             # Search for posts
             try:
                 async for post in subreddit.search(
-                    keyword, 
+                    search_query, 
                     sort='new', 
                     time_filter=self.search_time_filter, 
                     limit=self.search_limit
@@ -297,7 +301,7 @@ class RedditTelegramBot:
                 new_matches = 0
                 
                 async for comment in subreddit.search(
-                    keyword,
+                    search_query,
                     sort='new',
                     time_filter=self.search_time_filter,
                     limit=self.search_limit,
