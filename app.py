@@ -167,7 +167,14 @@ class RedditTelegramBot:
         try:
             if item_type == "post":
                 title = item.title[:200] + "..." if len(item.title) > 200 else item.title
-                content = item.selftext[:500] + "..." if len(item.selftext) > 500 else item.selftext
+                content = ""
+                
+                # Safely get selftext
+                try:
+                    if hasattr(item, 'selftext') and item.selftext:
+                        content = item.selftext[:500] + "..." if len(item.selftext) > 500 else item.selftext
+                except AttributeError:
+                    pass
                 
                 message = f"Keyword match: {keyword}\n\n"
                 message += f"Post: {title}\n"
@@ -180,12 +187,22 @@ class RedditTelegramBot:
                 message += f"\nLink: https://reddit.com{item.permalink}"
                 
             else:  # comment
-                content = item.body[:500] + "..." if len(item.body) > 500 else item.body
+                content = ""
+                
+                # Safely get body
+                try:
+                    if hasattr(item, 'body') and item.body:
+                        content = item.body[:500] + "..." if len(item.body) > 500 else item.body
+                except AttributeError:
+                    pass
                 
                 message = f"Keyword match: {keyword}\n\n"
                 message += f"Comment by: u/{item.author}\n"
                 message += f"Subreddit: r/{item.subreddit}\n"
-                message += f"\nComment:\n{content}\n"
+                
+                if content:
+                    message += f"\nComment:\n{content}\n"
+                
                 message += f"\nLink: https://reddit.com{item.permalink}"
                 
         except AttributeError as e:
@@ -285,8 +302,16 @@ class RedditTelegramBot:
                             continue
                         
                         # Validate that the post contains the exact phrase
+                        # Posts use 'selftext' not 'body'
                         title_match = self.contains_phrase(post.title, keyword)
-                        body_match = self.contains_phrase(post.selftext, keyword) if hasattr(post, 'selftext') else False
+                        body_match = False
+                        
+                        # Check if post has selftext and it's not empty
+                        try:
+                            if hasattr(post, 'selftext') and post.selftext:
+                                body_match = self.contains_phrase(post.selftext, keyword)
+                        except AttributeError:
+                            pass
 
                         if not (title_match or body_match):
                             logger.debug(f"Post {post.id} doesn't contain exact phrase, skipping")
@@ -329,9 +354,18 @@ class RedditTelegramBot:
                         if comment.id in self.processed_posts:
                             continue
                         
+                        # Comments use 'body' attribute
                         # Validate that the comment contains the exact phrase
-                        if not self.contains_phrase(comment.body, keyword):
-                            logger.debug(f"Comment {comment.id} doesn't contain exact phrase, skipping")
+                        try:
+                            if not hasattr(comment, 'body'):
+                                logger.debug(f"Comment {comment.id} has no body attribute, skipping")
+                                continue
+                                
+                            if not self.contains_phrase(comment.body, keyword):
+                                logger.debug(f"Comment {comment.id} doesn't contain exact phrase, skipping")
+                                continue
+                        except AttributeError as e:
+                            logger.error(f"AttributeError accessing comment body: {e}")
                             continue
 
                         new_matches += 1
