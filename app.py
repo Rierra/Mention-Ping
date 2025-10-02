@@ -69,6 +69,25 @@ class RedditTelegramBot:
         
         self.load_data()
 
+    def load_data(self):
+        """Load keywords, processed posts, and last search times from file"""
+        try:
+            if os.path.exists(self.data_file):
+                with open(self.data_file, 'r') as f:
+                    data = json.load(f)
+                    self.keywords = set(data.get('keywords', []))
+                    self.processed_posts = set(data.get('processed_posts', []))
+                    self.last_search_time = data.get('last_search_time', {})
+                    logger.info(f"Loaded {len(self.keywords)} keywords and {len(self.processed_posts)} processed posts")
+            else:
+                logger.info("No existing data file found, starting fresh")
+        except Exception as e:
+            logger.error(f"Error loading data: {e}")
+            # Initialize with empty data if loading fails
+            self.keywords = set()
+            self.processed_posts = set()
+            self.last_search_time = {}
+
     async def setup_reddit(self):
         """Initialize Reddit API client"""
         try:
