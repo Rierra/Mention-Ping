@@ -598,6 +598,11 @@ Example:
         # Start Telegram bot
         await app.initialize()
         await app.start()
+
+        # Delete any existing webhook first
+        await app.bot.delete_webhook(drop_pending_updates=True)
+        logger.info("Deleted existing webhook")
+        
         await app.updater.start_polling()
         
         logger.info("Telegram bot started")
