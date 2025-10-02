@@ -48,6 +48,7 @@ class RedditTelegramBot:
         self.check_interval = int(os.getenv('CHECK_INTERVAL', '300'))  # seconds
         self.search_limit = int(os.getenv('SEARCH_LIMIT', '50'))  # results per keyword
         self.search_time_filter = os.getenv('SEARCH_TIME_FILTER', 'hour')  # hour, day, week, month, year, all
+        self.comment_limit = int(os.getenv('COMMENT_LIMIT', '100'))  # comments to check per post
         
         # Data storage
         self.keywords: Set[str] = set()
@@ -278,6 +279,48 @@ class RedditTelegramBot:
         except Exception as e:
             logger.error(f"Error sending notification: {e}")
             raise
+
+    async def check_comments_in_post(self, post, keyword: str):
+        """Check all comments in a post for keyword matches"""
+        try:
+            # Expand all comments in the post
+            await post.comments.replace_more(limit=0)  # Don't expand "load more" links to save time
+            
+            comment_count = 0
+            matches_found = 0
+            
+            for comment in post.comments.list():
+                try:
+                    comment_count += 1
+                    
+                    # Skip if already processed
+                    if comment.id in self.processed_posts:
+                        continue
+                    
+                    # Check if comment contains the keyword
+                    if hasattr(comment, 'body') and self.contains_phrase(comment.body, keyword):
+                        matches_found += 1
+                        message = self.format_notification(comment, keyword, "comment")
+                        await self.send_notification(message)
+                        logger.info(f"Found matching comment {comment.id} in post {post.id}")
+                        self.processed_posts.add(comment.id)
+                        
+                        # Small delay
+                        await asyncio.sleep(0.1)
+                    
+                    # Limit number of comments checked per post
+                    if comment_count >= self.comment_limit:
+                        break
+                        
+                except Exception as e:
+                    logger.error(f"Error processing comment: {e}")
+                    continue
+            
+            if matches_found > 0:
+                logger.info(f"Found {matches_found} matching comments in post {post.id}")
+                
+        except Exception as e:
+            logger.error(f"Error checking comments in post: {e}")
     
     async def search_keyword(self, keyword: str):
         """Search Reddit for a specific keyword"""
@@ -293,7 +336,8 @@ class RedditTelegramBot:
             
             subreddit = await self.reddit.subreddit('all')
             results_found = 0
-            new_matches = 0
+            new_post_matches = 0
+            posts_to_check_comments = []
             
             # Search for posts
             try:
@@ -306,11 +350,9 @@ class RedditTelegramBot:
                     try:
                         results_found += 1
                         
-                        if post.id in self.processed_posts:
-                            continue
+                        post_already_processed = post.id in self.processed_posts
                         
                         # Validate that the post contains the exact phrase
-                        # Posts use 'selftext' not 'body'
                         title_match = self.contains_phrase(post.title, keyword)
                         body_match = False
                         
@@ -321,16 +363,18 @@ class RedditTelegramBot:
                         except AttributeError:
                             pass
 
-                        if not (title_match or body_match):
-                            logger.debug(f"Post {post.id} doesn't contain exact phrase, skipping")
-                            continue
+                        # If post matches and not already processed, send notification
+                        if (title_match or body_match) and not post_already_processed:
+                            new_post_matches += 1
+                            message = self.format_notification(post, keyword, "post")
+                            await self.send_notification(message)
+                            logger.info(f"Queued notification for post: {post.id}")
+                            self.processed_posts.add(post.id)
 
-                        new_matches += 1
-                        message = self.format_notification(post, keyword, "post")
-                        await self.send_notification(message)
-                        logger.info(f"Queued notification for post: {post.id}")
-                        
-                        self.processed_posts.add(post.id)
+                        # Always check comments in posts that match the search
+                        # (even if we've seen the post before, there might be new comments)
+                        if post.num_comments > 0:
+                            posts_to_check_comments.append(post)
                         
                         # Small delay to avoid rate limiting
                         await asyncio.sleep(0.1)
@@ -339,61 +383,20 @@ class RedditTelegramBot:
                         logger.error(f"Error processing search result post: {e}")
                         continue
                 
-                logger.info(f"Keyword '{keyword}': Found {results_found} posts, {new_matches} new matching exact phrase")
+                logger.info(f"Keyword '{keyword}': Found {results_found} posts, {new_post_matches} new matching posts")
                 
             except Exception as e:
                 logger.error(f"Error searching posts for keyword '{keyword}': {e}")
             
-            # Search for comments
-            try:
-                results_found = 0
-                new_matches = 0
-                
-                async for comment in subreddit.search(
-                    search_query,
-                    sort='new',
-                    time_filter=self.search_time_filter,
-                    limit=self.search_limit,
-                    params={'type': 'comment'}
-                ):
-                    try:
-                        results_found += 1
-                        
-                        if comment.id in self.processed_posts:
-                            continue
-                        
-                        # Comments use 'body' attribute
-                        # Validate that the comment contains the exact phrase
-                        try:
-                            if not hasattr(comment, 'body'):
-                                logger.debug(f"Comment {comment.id} has no body attribute, skipping")
-                                continue
-                                
-                            if not self.contains_phrase(comment.body, keyword):
-                                logger.debug(f"Comment {comment.id} doesn't contain exact phrase, skipping")
-                                continue
-                        except AttributeError as e:
-                            logger.error(f"AttributeError accessing comment body: {e}")
-                            continue
-
-                        new_matches += 1
-                        message = self.format_notification(comment, keyword, "comment")
-                        await self.send_notification(message)
-                        logger.info(f"Queued notification for comment: {comment.id}")
-                        
-                        self.processed_posts.add(comment.id)
-                        
-                        # Small delay to avoid rate limiting
-                        await asyncio.sleep(0.1)
-                        
-                    except Exception as e:
-                        logger.error(f"Error processing search result comment: {e}")
-                        continue
-                
-                logger.info(f"Keyword '{keyword}': Found {results_found} comments, {new_matches} new matching exact phrase")
-                
-            except Exception as e:
-                logger.error(f"Error searching comments for keyword '{keyword}': {e}")
+            # Now check comments in the posts we found
+            logger.info(f"Checking comments in {len(posts_to_check_comments)} posts for keyword '{keyword}'")
+            for post in posts_to_check_comments:
+                try:
+                    await self.check_comments_in_post(post, keyword)
+                    await asyncio.sleep(0.5)  # Delay between posts to avoid rate limiting
+                except Exception as e:
+                    logger.error(f"Error checking post {post.id} for comments: {e}")
+                    continue
             
             # Update last search time for this keyword
             self.last_search_time[keyword] = time.time()
@@ -505,6 +508,7 @@ class RedditTelegramBot:
         status_msg += f"Check interval: {self.check_interval} seconds\n"
         status_msg += f"Search limit: {self.search_limit} per keyword\n"
         status_msg += f"Search time filter: {self.search_time_filter}\n"
+        status_msg += f"Comment limit per post: {self.comment_limit}\n"
         status_msg += f"Reddit client: {'Active' if self.reddit else 'Not initialized'}\n"
         status_msg += f"Queued notifications: {len(self.pending_notifications)}"
         
@@ -523,7 +527,7 @@ Commands:
 /status - Show bot status
 /help - Show this help message
 
-The bot searches all of Reddit for your keywords and sends notifications with the full content and links when matches are found.
+The bot searches all of Reddit for your keywords in both posts and comments, then sends notifications when matches are found.
         """
         await update.message.reply_text(help_text.strip())
     
