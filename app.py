@@ -68,40 +68,39 @@ class RedditTelegramBot:
         self.reddit = None
         
         self.load_data()
-        
-            async def setup_reddit(self):
-                """Initialize Reddit API client"""
-                try:
-                    # Create aiohttp session for asyncpraw
-                    if not self.reddit_session or self.reddit_session.closed:
-                        timeout = aiohttp.ClientTimeout(total=30, connect=10)
-                        self.reddit_session = aiohttp.ClientSession(timeout=timeout)
-                    
-                    if self.reddit_username and self.reddit_password:
-                        # Authenticated instance (higher rate limits)
-                        self.reddit = asyncpraw.Reddit(
-                            client_id=self.reddit_client_id,
-                            client_secret=self.reddit_client_secret,
-                            user_agent=self.reddit_user_agent,
-                            username=self.reddit_username,
-                            password=self.reddit_password,
-                            requestor_kwargs={'session': self.reddit_session}
-                        )
-                    else:
-                        # Read-only instance
-                        self.reddit = asyncpraw.Reddit(
-                            client_id=self.reddit_client_id,
-                            client_secret=self.reddit_client_secret,
-                            user_agent=self.reddit_user_agent,
-                            requestor_kwargs={'session': self.reddit_session}
-                        )
-                    
-                    logger.info("Reddit API initialized successfully")
-                    
-                except Exception as e:
-                    logger.error(f"Failed to initialize Reddit API: {e}")
-                    raise    
-    def load_data(self):
+
+    async def setup_reddit(self):
+        """Initialize Reddit API client"""
+        try:
+            # Create aiohttp session for asyncpraw
+            if not self.reddit_session or self.reddit_session.closed:
+                timeout = aiohttp.ClientTimeout(total=30, connect=10)
+                self.reddit_session = aiohttp.ClientSession(timeout=timeout)
+            
+            if self.reddit_username and self.reddit_password:
+                # Authenticated instance (higher rate limits)
+                self.reddit = asyncpraw.Reddit(
+                    client_id=self.reddit_client_id,
+                    client_secret=self.reddit_client_secret,
+                    user_agent=self.reddit_user_agent,
+                    username=self.reddit_username,
+                    password=self.reddit_password,
+                    requestor_kwargs={'session': self.reddit_session}
+                )
+            else:
+                # Read-only instance
+                self.reddit = asyncpraw.Reddit(
+                    client_id=self.reddit_client_id,
+                    client_secret=self.reddit_client_secret,
+                    user_agent=self.reddit_user_agent,
+                    requestor_kwargs={'session': self.reddit_session}
+                )
+            
+            logger.info("Reddit API initialized successfully")
+            
+        except Exception as e:
+            logger.error(f"Failed to initialize Reddit API: {e}")
+            raise
         """Load keywords, processed posts, and last search times from file"""
         try:
             if os.path.exists(self.data_file):
