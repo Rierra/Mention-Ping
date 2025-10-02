@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
 Reddit to Telegram Monitor Bot
-Monitors Reddit using search API for specific keywords and sends notifications
+Monitors Reddit comprehensively for keywords in BOTH posts and comments
+Uses Reddit API + direct subreddit comment streams for complete coverage
 """
 
 import os
@@ -46,59 +47,59 @@ class RedditTelegramBot:
         
         # Configuration
         self.check_interval = int(os.getenv('CHECK_INTERVAL', '300'))  # seconds
-        self.search_limit = int(os.getenv('SEARCH_LIMIT', '50'))  # results per keyword
+        self.search_limit = int(os.getenv('SEARCH_LIMIT', '100'))  # results per keyword
         self.search_time_filter = os.getenv('SEARCH_TIME_FILTER', 'hour')  # hour, day, week, month, year, all
-        self.comment_limit = int(os.getenv('COMMENT_LIMIT', '100'))  # comments to check per post
+        
+        # Popular subreddits to monitor for comprehensive coverage
+        self.target_subreddits = os.getenv('TARGET_SUBREDDITS', 'all').split(',')
         
         # Data storage
         self.keywords: Set[str] = set()
-        self.processed_posts: Set[str] = set()
-        self.last_search_time: Dict[str, float] = {}  # Track last search time per keyword
+        self.processed_items: Set[str] = set()  # stores both post and comment IDs
+        self.last_search_time: Dict[str, float] = {}
         self.data_file = 'bot_data.json'
         
         # Rate limiting for notifications
-        self.notification_delay = 5  # seconds between notifications
+        self.notification_delay = 3  # seconds between notifications
         self.pending_notifications = []
         
-        # Initialize HTTP session for Telegram
-        # Separate sessions for Reddit and Telegram
+        # Sessions
         self.telegram_session = None
         self.reddit_session = None
-        
-        # Reddit client will be initialized in setup_reddit
         self.reddit = None
+        
+        # Stream control
+        self.stream_task = None
+        self.stop_stream = False
         
         self.load_data()
 
     def load_data(self):
-        """Load keywords, processed posts, and last search times from file"""
+        """Load keywords and processed items from file"""
         try:
             if os.path.exists(self.data_file):
                 with open(self.data_file, 'r') as f:
                     data = json.load(f)
                     self.keywords = set(data.get('keywords', []))
-                    self.processed_posts = set(data.get('processed_posts', []))
+                    self.processed_items = set(data.get('processed_items', []))
                     self.last_search_time = data.get('last_search_time', {})
-                    logger.info(f"Loaded {len(self.keywords)} keywords and {len(self.processed_posts)} processed posts")
+                    logger.info(f"Loaded {len(self.keywords)} keywords and {len(self.processed_items)} processed items")
             else:
                 logger.info("No existing data file found, starting fresh")
         except Exception as e:
             logger.error(f"Error loading data: {e}")
-            # Initialize with empty data if loading fails
             self.keywords = set()
-            self.processed_posts = set()
+            self.processed_items = set()
             self.last_search_time = {}
 
     async def setup_reddit(self):
         """Initialize Reddit API client"""
         try:
-            # Create aiohttp session for asyncpraw
             if not self.reddit_session or self.reddit_session.closed:
                 timeout = aiohttp.ClientTimeout(total=30, connect=10)
                 self.reddit_session = aiohttp.ClientSession(timeout=timeout)
             
             if self.reddit_username and self.reddit_password:
-                # Authenticated instance (higher rate limits)
                 self.reddit = asyncpraw.Reddit(
                     client_id=self.reddit_client_id,
                     client_secret=self.reddit_client_secret,
@@ -108,7 +109,6 @@ class RedditTelegramBot:
                     requestor_kwargs={'session': self.reddit_session}
                 )
             else:
-                # Read-only instance
                 self.reddit = asyncpraw.Reddit(
                     client_id=self.reddit_client_id,
                     client_secret=self.reddit_client_secret,
@@ -123,15 +123,15 @@ class RedditTelegramBot:
             raise
     
     def save_data(self):
-        """Save keywords, processed posts, and last search times to file"""
+        """Save keywords and processed items to file"""
         try:
-            # Limit processed posts to last 10000 to prevent file from growing too large
-            if len(self.processed_posts) > 10000:
-                self.processed_posts = set(list(self.processed_posts)[-5000:])
+            # Limit processed items to prevent file growth
+            if len(self.processed_items) > 10000:
+                self.processed_items = set(list(self.processed_items)[-5000:])
                 
             data = {
                 'keywords': list(self.keywords),
-                'processed_posts': list(self.processed_posts),
+                'processed_items': list(self.processed_items),
                 'last_search_time': self.last_search_time
             }
             with open(self.data_file, 'w') as f:
@@ -139,35 +139,10 @@ class RedditTelegramBot:
         except Exception as e:
             logger.error(f"Error saving data: {e}")
     
-    def clean_text_for_telegram(self, text: str) -> str:
-        """Clean text for Telegram by removing/escaping problematic characters"""
-        if not text:
-            return ""
-        
-        # Unescape HTML entities first
-        text = html.unescape(text)
-        
-        # Remove markdown formatting that might cause issues
-        text = re.sub(r'\*{1,2}([^*]+)\*{1,2}', r'\1', text)  # Remove bold/italic
-        text = re.sub(r'_{1,2}([^_]+)_{1,2}', r'\1', text)    # Remove underline
-        text = re.sub(r'`([^`]+)`', r'\1', text)              # Remove code formatting
-        text = re.sub(r'~~([^~]+)~~', r'\1', text)            # Remove strikethrough
-        
-        # Remove or replace other problematic characters
-        text = re.sub(r'[<>]', '', text)  # Remove angle brackets
-        text = re.sub(r'&[a-zA-Z0-9#]+;', '', text)  # Remove remaining HTML entities
-        
-        # Clean up extra whitespace
-        text = re.sub(r'\n{3,}', '\n\n', text)  # Max 2 consecutive newlines
-        text = re.sub(r' {2,}', ' ', text)      # Remove multiple spaces
-        
-        return text.strip()
-    
     def contains_phrase(self, text: str, phrase: str) -> bool:
         """Check if text contains the exact phrase (case-insensitive)"""
         if not text or not phrase:
             return False
-        # Use word boundaries to match whole phrase
         pattern = r'\b' + re.escape(phrase.lower()) + r'\b'
         return bool(re.search(pattern, text.lower()))
     
@@ -178,45 +153,43 @@ class RedditTelegramBot:
                 title = item.title[:200] + "..." if len(item.title) > 200 else item.title
                 content = ""
                 
-                # Safely get selftext
                 try:
                     if hasattr(item, 'selftext') and item.selftext:
                         content = item.selftext[:500] + "..." if len(item.selftext) > 500 else item.selftext
                 except AttributeError:
                     pass
                 
-                message = f"Keyword match: {keyword}\n\n"
-                message += f"Post: {title}\n"
-                message += f"By: u/{item.author}\n"
-                message += f"Subreddit: r/{item.subreddit}\n"
+                message = f"🔍 Keyword: {keyword}\n\n"
+                message += f"📝 Post: {title}\n"
+                message += f"👤 By: u/{item.author}\n"
+                message += f"📍 Subreddit: r/{item.subreddit}\n"
                 
                 if content and content.strip():
-                    message += f"\nContent:\n{content}\n"
+                    message += f"\n💬 Content:\n{content}\n"
                 
-                message += f"\nLink: https://reddit.com{item.permalink}"
+                message += f"\n🔗 https://reddit.com{item.permalink}"
                 
             else:  # comment
                 content = ""
                 
-                # Safely get body
                 try:
                     if hasattr(item, 'body') and item.body:
                         content = item.body[:500] + "..." if len(item.body) > 500 else item.body
                 except AttributeError:
                     pass
                 
-                message = f"Keyword match: {keyword}\n\n"
-                message += f"Comment by: u/{item.author}\n"
-                message += f"Subreddit: r/{item.subreddit}\n"
+                message = f"🔍 Keyword: {keyword}\n\n"
+                message += f"💬 Comment by: u/{item.author}\n"
+                message += f"📍 Subreddit: r/{item.subreddit}\n"
                 
                 if content:
-                    message += f"\nComment:\n{content}\n"
+                    message += f"\n💭 Comment:\n{content}\n"
                 
-                message += f"\nLink: https://reddit.com{item.permalink}"
+                message += f"\n🔗 https://reddit.com{item.permalink}"
                 
         except AttributeError as e:
             logger.error(f"Error formatting notification: {e}")
-            message = f"Keyword match: {keyword}\n\nError formatting item details."
+            message = f"🔍 Keyword: {keyword}\n\nError formatting item details."
         
         return message
     
@@ -233,16 +206,14 @@ class RedditTelegramBot:
                 await self._send_telegram_message(message)
                 logger.info("Notification sent successfully")
                 
-                # Wait before sending next notification
-                if self.pending_notifications:  # Only wait if there are more to send
+                if self.pending_notifications:
                     await asyncio.sleep(self.notification_delay)
                     
             except Exception as e:
                 logger.error(f"Error processing notification: {e}")
-                # Re-add the message to the front of the queue to retry later
                 self.pending_notifications.insert(0, message)
-                await asyncio.sleep(self.notification_delay * 2)  # Wait longer on error
-                break  # Exit loop to prevent infinite retry in same cycle
+                await asyncio.sleep(self.notification_delay * 2)
+                break
     
     async def _send_telegram_message(self, message: str):
         """Send a single message to Telegram"""
@@ -260,12 +231,11 @@ class RedditTelegramBot:
             }
             
             async with self.telegram_session.post(url, data=data) as response:
-                if response.status == 429:  # Rate limited
+                if response.status == 429:
                     response_json = await response.json()
                     retry_after = response_json.get('parameters', {}).get('retry_after', 60)
                     logger.warning(f"Rate limited, waiting {retry_after} seconds")
                     await asyncio.sleep(retry_after)
-                    # Retry the request
                     async with self.telegram_session.post(url, data=data) as retry_response:
                         if retry_response.status != 200:
                             response_text = await retry_response.text()
@@ -280,132 +250,161 @@ class RedditTelegramBot:
             logger.error(f"Error sending notification: {e}")
             raise
 
-    async def check_comments_in_post(self, post, keyword: str):
-        """Check all comments in a post for keyword matches"""
+    async def search_posts(self, keyword: str):
+        """Search Reddit posts for keyword"""
         try:
-            if not post.comments:
-                return
-
-            # Expand all comments in the post
-            await post.comments.replace_more(limit=0)  # Don't expand "load more" links to save time
+            logger.info(f"Searching posts for keyword: {keyword}")
             
-            comment_count = 0
-            matches_found = 0
+            subreddit = await self.reddit.subreddit('all')
+            new_matches = 0
             
-            for comment in post.comments.list():
+            async for post in subreddit.search(
+                keyword, 
+                sort='new', 
+                time_filter=self.search_time_filter, 
+                limit=self.search_limit
+            ):
                 try:
-                    comment_count += 1
-                    
-                    # Skip if already processed
-                    if comment.id in self.processed_posts:
+                    if post.id in self.processed_items:
                         continue
                     
-                    # Check if comment contains the keyword
-                    if hasattr(comment, 'body') and self.contains_phrase(comment.body, keyword):
-                        matches_found += 1
-                        message = self.format_notification(comment, keyword, "comment")
-                        await self.send_notification(message)
-                        logger.info(f"Found matching comment {comment.id} in post {post.id}")
-                        self.processed_posts.add(comment.id)
-                        
-                        # Small delay
-                        await asyncio.sleep(0.1)
+                    # Validate exact phrase match
+                    title_match = self.contains_phrase(post.title, keyword)
+                    body_match = False
                     
-                    # Limit number of comments checked per post
-                    if comment_count >= self.comment_limit:
-                        break
-                        
+                    try:
+                        if hasattr(post, 'selftext') and post.selftext:
+                            body_match = self.contains_phrase(post.selftext, keyword)
+                    except AttributeError:
+                        pass
+
+                    if title_match or body_match:
+                        new_matches += 1
+                        message = self.format_notification(post, keyword, "post")
+                        await self.send_notification(message)
+                        self.processed_items.add(post.id)
+                        logger.info(f"Found matching post: {post.id}")
+                    
+                    await asyncio.sleep(0.1)
+                    
                 except Exception as e:
-                    logger.error(f"Error processing comment: {e}")
+                    logger.error(f"Error processing post: {e}")
                     continue
             
-            if matches_found > 0:
-                logger.info(f"Found {matches_found} matching comments in post {post.id}")
-                
+            logger.info(f"Post search for '{keyword}': {new_matches} new matches")
+            
         except Exception as e:
-            logger.error(f"Error checking comments in post: {e}")
+            logger.error(f"Error searching posts for '{keyword}': {e}")
+
+    async def search_comments_via_posts(self, keyword: str):
+        """Search for comments by finding recent posts and checking their comments"""
+        try:
+            logger.info(f"Searching comments (via posts) for keyword: {keyword}")
+            
+            subreddit = await self.reddit.subreddit('all')
+            new_matches = 0
+            
+            # Get recent posts to check their comments
+            async for post in subreddit.new(limit=self.search_limit):
+                try:
+                    if post.num_comments == 0:
+                        continue
+                    
+                    # Expand comments
+                    await post.comments.replace_more(limit=0)
+                    
+                    for comment in post.comments.list():
+                        try:
+                            if comment.id in self.processed_items:
+                                continue
+                            
+                            if hasattr(comment, 'body') and self.contains_phrase(comment.body, keyword):
+                                new_matches += 1
+                                message = self.format_notification(comment, keyword, "comment")
+                                await self.send_notification(message)
+                                self.processed_items.add(comment.id)
+                                logger.info(f"Found matching comment: {comment.id}")
+                            
+                        except Exception as e:
+                            logger.error(f"Error processing comment: {e}")
+                            continue
+                    
+                    await asyncio.sleep(0.5)
+                    
+                except Exception as e:
+                    logger.error(f"Error processing post comments: {e}")
+                    continue
+            
+            logger.info(f"Comment search (via posts) for '{keyword}': {new_matches} new matches")
+            
+        except Exception as e:
+            logger.error(f"Error searching comments via posts for '{keyword}': {e}")
+
+    async def stream_comments(self):
+        """Stream new comments from Reddit in real-time"""
+        logger.info("Starting comment stream...")
+        
+        while not self.stop_stream:
+            try:
+                if not self.reddit:
+                    await self.setup_reddit()
+                
+                subreddit = await self.reddit.subreddit('all')
+                
+                async for comment in subreddit.stream.comments(skip_existing=True):
+                    if self.stop_stream:
+                        break
+                    
+                    try:
+                        # Skip if already processed
+                        if comment.id in self.processed_items:
+                            continue
+                        
+                        # Check against all keywords
+                        for keyword in list(self.keywords):
+                            if hasattr(comment, 'body') and self.contains_phrase(comment.body, keyword):
+                                message = self.format_notification(comment, keyword, "comment")
+                                await self.send_notification(message)
+                                self.processed_items.add(comment.id)
+                                logger.info(f"Stream found matching comment: {comment.id} for keyword: {keyword}")
+                                break  # Only notify once per comment even if multiple keywords match
+                        
+                    except Exception as e:
+                        logger.error(f"Error processing streamed comment: {e}")
+                        continue
+                
+            except Exception as e:
+                logger.error(f"Error in comment stream: {e}")
+                # Try to recover
+                if self.reddit:
+                    try:
+                        await self.reddit.close()
+                    except:
+                        pass
+                    self.reddit = None
+                await asyncio.sleep(30)  # Wait before retrying
     
     async def search_keyword(self, keyword: str):
-        """Search Reddit for a specific keyword"""
+        """Comprehensive search for a keyword in both posts and comments"""
         try:
             if not self.reddit:
                 await self.setup_reddit()
             
-            logger.info(f"Searching Reddit for keyword: {keyword}")
+            logger.info(f"Starting comprehensive search for: {keyword}")
             
-            # Search without quotes - Reddit's API works better this way
-            search_query = keyword
-            logger.info(f"Search query: {search_query}")
+            # Search posts
+            await self.search_posts(keyword)
             
-            subreddit = await self.reddit.subreddit('all')
-            results_found = 0
-            new_post_matches = 0
-            posts_to_check_comments = []
+            # Search comments via recent posts
+            await self.search_comments_via_posts(keyword)
             
-            # Search for posts
-            try:
-                async for post in subreddit.search(
-                    search_query, 
-                    sort='new', 
-                    time_filter=self.search_time_filter, 
-                    limit=self.search_limit
-                ):
-                    try:
-                        results_found += 1
-                        
-                        post_already_processed = post.id in self.processed_posts
-                        
-                        # Validate that the post contains the exact phrase
-                        title_match = self.contains_phrase(post.title, keyword)
-                        body_match = False
-                        
-                        # Check if post has selftext and it's not empty
-                        try:
-                            if hasattr(post, 'selftext') and post.selftext:
-                                body_match = self.contains_phrase(post.selftext, keyword)
-                        except AttributeError:
-                            pass
-
-                        # If post matches and not already processed, send notification
-                        if (title_match or body_match) and not post_already_processed:
-                            new_post_matches += 1
-                            message = self.format_notification(post, keyword, "post")
-                            await self.send_notification(message)
-                            logger.info(f"Queued notification for post: {post.id}")
-                            self.processed_posts.add(post.id)
-
-                        # Always check comments in posts that match the search
-                        # (even if we've seen the post before, there might be new comments)
-                        if post.num_comments > 0:
-                            posts_to_check_comments.append(post)
-                        
-                        # Small delay to avoid rate limiting
-                        await asyncio.sleep(0.1)
-                        
-                    except Exception as e:
-                        logger.error(f"Error processing search result post: {e}")
-                        continue
-                
-                logger.info(f"Keyword '{keyword}': Found {results_found} posts, {new_post_matches} new matching posts")
-                
-            except Exception as e:
-                logger.error(f"Error searching posts for keyword '{keyword}': {e}")
-            
-            # Now check comments in the posts we found
-            logger.info(f"Checking comments in {len(posts_to_check_comments)} posts for keyword '{keyword}'")
-            for post in posts_to_check_comments:
-                try:
-                    await self.check_comments_in_post(post, keyword)
-                    await asyncio.sleep(0.5)  # Delay between posts to avoid rate limiting
-                except Exception as e:
-                    logger.error(f"Error checking post {post.id} for comments: {e}")
-                    continue
-            
-            # Update last search time for this keyword
+            # Update last search time
             self.last_search_time[keyword] = time.time()
             
+            logger.info(f"Completed search for: {keyword}")
+            
         except Exception as e:
-            logger.error(f"Error searching keyword '{keyword}': {e}")
+            logger.error(f"Error in comprehensive search for '{keyword}': {e}")
     
     async def monitor_reddit(self):
         """Monitor Reddit for keyword matches using search"""
@@ -422,9 +421,7 @@ class RedditTelegramBot:
             for keyword in list(self.keywords):
                 try:
                     await self.search_keyword(keyword)
-                    
-                    # Delay between keyword searches to respect rate limits
-                    await asyncio.sleep(2)
+                    await asyncio.sleep(2)  # Delay between keywords
                     
                 except Exception as e:
                     logger.error(f"Error processing keyword '{keyword}': {e}")
@@ -439,7 +436,6 @@ class RedditTelegramBot:
             
         except Exception as e:
             logger.error(f"Error monitoring Reddit: {e}")
-            # Try to reinitialize Reddit client on error
             if self.reddit:
                 try:
                     await self.reddit.close()
@@ -461,7 +457,7 @@ class RedditTelegramBot:
         
         self.keywords.add(keyword)
         self.save_data()
-        await update.message.reply_text(f"Added keyword: {keyword}")
+        await update.message.reply_text(f"✅ Added keyword: {keyword}\n\nNow monitoring in posts, comments, and real-time stream!")
         logger.info(f"Added keyword: {keyword}")
     
     async def remove_keyword(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -477,11 +473,10 @@ class RedditTelegramBot:
             return
         
         self.keywords.remove(keyword)
-        # Remove last search time for this keyword
         if keyword in self.last_search_time:
             del self.last_search_time[keyword]
         self.save_data()
-        await update.message.reply_text(f"Removed keyword: {keyword}")
+        await update.message.reply_text(f"✅ Removed keyword: {keyword}")
         logger.info(f"Removed keyword: {keyword}")
     
     async def list_keywords(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -490,8 +485,8 @@ class RedditTelegramBot:
             await update.message.reply_text("No keywords being monitored.")
             return
         
-        keywords_list = '\n'.join(f"- {keyword}" for keyword in sorted(self.keywords))
-        message = f"Monitoring {len(self.keywords)} keywords:\n\n{keywords_list}"
+        keywords_list = '\n'.join(f"• {keyword}" for keyword in sorted(self.keywords))
+        message = f"📋 Monitoring {len(self.keywords)} keywords:\n\n{keywords_list}"
         await update.message.reply_text(message)
     
     async def clear_keywords(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -500,37 +495,46 @@ class RedditTelegramBot:
         self.keywords.clear()
         self.last_search_time.clear()
         self.save_data()
-        await update.message.reply_text(f"Cleared {count} keywords.")
+        await update.message.reply_text(f"✅ Cleared {count} keywords.")
         logger.info(f"Cleared {count} keywords")
     
     async def status(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Show bot status"""
-        status_msg = f"Bot Status:\n\n"
-        status_msg += f"Keywords monitored: {len(self.keywords)}\n"
-        status_msg += f"Posts processed: {len(self.processed_posts)}\n"
-        status_msg += f"Check interval: {self.check_interval} seconds\n"
-        status_msg += f"Search limit: {self.search_limit} per keyword\n"
-        status_msg += f"Search time filter: {self.search_time_filter}\n"
-        status_msg += f"Comment limit per post: {self.comment_limit}\n"
-        status_msg += f"Reddit client: {'Active' if self.reddit else 'Not initialized'}\n"
-        status_msg += f"Queued notifications: {len(self.pending_notifications)}"
+        status_msg = f"📊 Bot Status:\n\n"
+        status_msg += f"🔍 Keywords monitored: {len(self.keywords)}\n"
+        status_msg += f"✅ Items processed: {len(self.processed_items)}\n"
+        status_msg += f"⏱ Check interval: {self.check_interval} seconds\n"
+        status_msg += f"📈 Search limit: {self.search_limit} per keyword\n"
+        status_msg += f"📅 Time filter: {self.search_time_filter}\n"
+        status_msg += f"🤖 Reddit client: {'Active' if self.reddit else 'Not initialized'}\n"
+        status_msg += f"📬 Queued notifications: {len(self.pending_notifications)}\n"
+        status_msg += f"🌊 Comment stream: {'Running' if self.stream_task and not self.stream_task.done() else 'Stopped'}"
         
         await update.message.reply_text(status_msg)
     
     async def help_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Show help message"""
         help_text = """
-Reddit to Telegram Monitor Bot
+🤖 Reddit to Telegram Monitor Bot
 
-Commands:
-/add <keyword> - Add keyword to monitor (e.g., /add pain killer)
-/remove <keyword> - Remove keyword from monitoring
+📋 Commands:
+/add <keyword> - Add keyword to monitor
+/remove <keyword> - Remove keyword
 /list - List all monitored keywords
 /clear - Clear all keywords
 /status - Show bot status
 /help - Show this help message
 
-The bot searches all of Reddit for your keywords in both posts and comments, then sends notifications when matches are found.
+🔍 Features:
+• Searches ALL Reddit posts for keywords
+• Searches comments in recent posts
+• Real-time comment streaming
+• Phrase matching (exact words)
+
+📝 Example:
+/add pain killer
+
+The bot will find "pain killer" in posts and comments across all of Reddit!
         """
         await update.message.reply_text(help_text.strip())
     
@@ -543,21 +547,20 @@ The bot searches all of Reddit for your keywords in both posts and comments, the
                 await asyncio.sleep(self.check_interval)
             except Exception as e:
                 logger.error(f"Error in monitoring loop: {e}")
-                # Close and reset Reddit client on major errors
                 if self.reddit:
                     try:
                         await self.reddit.close()
                     except:
                         pass
                     self.reddit = None
-                await asyncio.sleep(60)  # Wait 1 minute before retrying
+                await asyncio.sleep(60)
     
     async def start_bot(self):
         """Start the Telegram bot and monitoring"""
-        # Initialize Reddit first
+        # Initialize Reddit
         await self.setup_reddit()
         
-        # Create application
+        # Create Telegram application
         app = Application.builder().token(self.telegram_token).build()
         
         # Add handlers
@@ -569,18 +572,33 @@ The bot searches all of Reddit for your keywords in both posts and comments, the
         app.add_handler(CommandHandler("help", self.help_command))
         app.add_handler(CommandHandler("start", self.help_command))
         
-        # Start polling
+        # Start Telegram bot
         await app.initialize()
         await app.start()
         await app.updater.start_polling()
         
         logger.info("Telegram bot started")
         
+        # Start comment stream in background
+        self.stream_task = asyncio.create_task(self.stream_comments())
+        logger.info("Comment stream started")
+        
         # Start monitoring loop
         await self.monitoring_loop()
 
     async def cleanup(self):
         """Clean up resources"""
+        logger.info("Cleaning up resources...")
+        
+        self.stop_stream = True
+        
+        if self.stream_task:
+            self.stream_task.cancel()
+            try:
+                await self.stream_task
+            except asyncio.CancelledError:
+                pass
+        
         try:
             if self.reddit:
                 await self.reddit.close()
@@ -601,7 +619,6 @@ The bot searches all of Reddit for your keywords in both posts and comments, the
 
 def main():
     """Main function"""
-    # Validate environment variables
     required_vars = [
         'TELEGRAM_BOT_TOKEN',
         'TELEGRAM_CHAT_ID',
@@ -614,7 +631,6 @@ def main():
         logger.error(f"Missing required environment variables: {', '.join(missing_vars)}")
         return
     
-    # Create and start bot
     bot = RedditTelegramBot()
     
     try:
