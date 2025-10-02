@@ -101,17 +101,6 @@ class RedditTelegramBot:
         except Exception as e:
             logger.error(f"Failed to initialize Reddit API: {e}")
             raise
-        """Load keywords, processed posts, and last search times from file"""
-        try:
-            if os.path.exists(self.data_file):
-                with open(self.data_file, 'r') as f:
-                    data = json.load(f)
-                    self.keywords = set(data.get('keywords', []))
-                    self.processed_posts = set(data.get('processed_posts', []))
-                    self.last_search_time = data.get('last_search_time', {})
-                    logger.info(f"Loaded {len(self.keywords)} keywords and {len(self.processed_posts)} processed posts")
-        except Exception as e:
-            logger.error(f"Error loading data: {e}")
     
     def save_data(self):
         """Save keywords, processed posts, and last search times to file"""
