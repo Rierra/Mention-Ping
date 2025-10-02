@@ -283,6 +283,9 @@ class RedditTelegramBot:
     async def check_comments_in_post(self, post, keyword: str):
         """Check all comments in a post for keyword matches"""
         try:
+            if not post.comments:
+                return
+
             # Expand all comments in the post
             await post.comments.replace_more(limit=0)  # Don't expand "load more" links to save time
             
