@@ -475,9 +475,14 @@ Note: The bot monitors NEW comments in real-time. For historical comments, Reddi
         app.add_handler(CommandHandler("status", self.status))
         app.add_handler(CommandHandler("help", self.help_command))
         app.add_handler(CommandHandler("start", self.help_command))
+
         
         await app.initialize()
         await app.start()
+
+        # Delete any existing webhook first
+        await app.bot.delete_webhook(drop_pending_updates=True)
+        logger.info("Deleted existing webhook")
         await app.updater.start_polling()
         
         logger.info("Telegram bot started")
