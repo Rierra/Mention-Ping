@@ -60,46 +60,47 @@ class RedditTelegramBot:
         self.pending_notifications = []
         
         # Initialize HTTP session for Telegram
-        self.session = None
+        # Separate sessions for Reddit and Telegram
+        self.telegram_session = None
+        self.reddit_session = None
         
         # Reddit client will be initialized in setup_reddit
         self.reddit = None
         
         self.load_data()
         
-    async def setup_reddit(self):
-        """Initialize Reddit API client"""
-        try:
-            # Create aiohttp session for asyncpraw
-            if not self.session:
-                timeout = aiohttp.ClientTimeout(total=30, connect=10)
-                self.session = aiohttp.ClientSession(timeout=timeout)
-            
-            if self.reddit_username and self.reddit_password:
-                # Authenticated instance (higher rate limits)
-                self.reddit = asyncpraw.Reddit(
-                    client_id=self.reddit_client_id,
-                    client_secret=self.reddit_client_secret,
-                    user_agent=self.reddit_user_agent,
-                    username=self.reddit_username,
-                    password=self.reddit_password,
-                    requestor_kwargs={'session': self.session}
-                )
-            else:
-                # Read-only instance
-                self.reddit = asyncpraw.Reddit(
-                    client_id=self.reddit_client_id,
-                    client_secret=self.reddit_client_secret,
-                    user_agent=self.reddit_user_agent,
-                    requestor_kwargs={'session': self.session}
-                )
-            
-            logger.info("Reddit API initialized successfully")
-            
-        except Exception as e:
-            logger.error(f"Failed to initialize Reddit API: {e}")
-            raise
-    
+            async def setup_reddit(self):
+                """Initialize Reddit API client"""
+                try:
+                    # Create aiohttp session for asyncpraw
+                    if not self.reddit_session or self.reddit_session.closed:
+                        timeout = aiohttp.ClientTimeout(total=30, connect=10)
+                        self.reddit_session = aiohttp.ClientSession(timeout=timeout)
+                    
+                    if self.reddit_username and self.reddit_password:
+                        # Authenticated instance (higher rate limits)
+                        self.reddit = asyncpraw.Reddit(
+                            client_id=self.reddit_client_id,
+                            client_secret=self.reddit_client_secret,
+                            user_agent=self.reddit_user_agent,
+                            username=self.reddit_username,
+                            password=self.reddit_password,
+                            requestor_kwargs={'session': self.reddit_session}
+                        )
+                    else:
+                        # Read-only instance
+                        self.reddit = asyncpraw.Reddit(
+                            client_id=self.reddit_client_id,
+                            client_secret=self.reddit_client_secret,
+                            user_agent=self.reddit_user_agent,
+                            requestor_kwargs={'session': self.reddit_session}
+                        )
+                    
+                    logger.info("Reddit API initialized successfully")
+                    
+                except Exception as e:
+                    logger.error(f"Failed to initialize Reddit API: {e}")
+                    raise    
     def load_data(self):
         """Load keywords, processed posts, and last search times from file"""
         try:
@@ -238,9 +239,9 @@ class RedditTelegramBot:
     async def _send_telegram_message(self, message: str):
         """Send a single message to Telegram"""
         try:
-            if not self.session:
+            if not self.telegram_session or self.telegram_session.closed:
                 timeout = aiohttp.ClientTimeout(total=30)
-                self.session = aiohttp.ClientSession(timeout=timeout)
+                self.telegram_session = aiohttp.ClientSession(timeout=timeout)
                 
             url = f"https://api.telegram.org/bot{self.telegram_token}/sendMessage"
             data = {
@@ -250,14 +251,14 @@ class RedditTelegramBot:
                 'disable_web_page_preview': True
             }
             
-            async with self.session.post(url, data=data) as response:
+            async with self.telegram_session.post(url, data=data) as response:
                 if response.status == 429:  # Rate limited
                     response_json = await response.json()
                     retry_after = response_json.get('parameters', {}).get('retry_after', 60)
                     logger.warning(f"Rate limited, waiting {retry_after} seconds")
                     await asyncio.sleep(retry_after)
                     # Retry the request
-                    async with self.session.post(url, data=data) as retry_response:
+                    async with self.telegram_session.post(url, data=data) as retry_response:
                         if retry_response.status != 200:
                             response_text = await retry_response.text()
                             logger.error(f"Failed to send notification after retry: {response_text}")
@@ -405,7 +406,7 @@ class RedditTelegramBot:
             
             logger.info(f"Starting search for {len(self.keywords)} keywords...")
             
-            for keyword in self.keywords:
+            for keyword in list(self.keywords):
                 try:
                     await self.search_keyword(keyword)
                     
@@ -573,10 +574,16 @@ The bot searches all of Reddit for your keywords and sends notifications with th
             logger.error(f"Error closing Reddit client: {e}")
         
         try:
-            if self.session:
-                await self.session.close()
+            if self.reddit_session and not self.reddit_session.closed:
+                await self.reddit_session.close()
         except Exception as e:
-            logger.error(f"Error closing HTTP session: {e}")
+            logger.error(f"Error closing Reddit session: {e}")
+    
+        try:
+            if self.telegram_session and not self.telegram_session.closed:
+                await self.telegram_session.close()
+        except Exception as e:
+            logger.error(f"Error closing Telegram session: {e}")
 
 def main():
     """Main function"""
