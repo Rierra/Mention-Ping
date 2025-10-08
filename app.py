@@ -56,8 +56,10 @@ class RedditTelegramBot:
         self.processed_items: Dict[int, Set[str]] = {}  # group_id -> set of processed item IDs
         self.last_search_time: Dict[str, float] = {}  # "group_id:keyword" -> timestamp
         
-        # Temporary state for adding keywords
+        # Temporary state for adding keywords and menu navigation
         self.pending_keyword_add: Dict[int, int] = {}  # user_id -> selected_group_id
+        self.pending_keyword_remove: Dict[int, int] = {}  # user_id -> selected_group_id
+        self.menu_state: Dict[int, str] = {}  # user_id -> current_menu_state
         
         self.data_file = 'bot_data.json'
         
@@ -659,7 +661,7 @@ class RedditTelegramBot:
             await update.message.reply_text(f"Error removing group: {e}")
     
     async def group(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Select a group to add keywords to (Owner only)"""
+        """Select a group to manage via interactive menu (Owner only)"""
         chat_id = update.effective_chat.id
         
         if not self.is_owner(chat_id):
@@ -674,50 +676,189 @@ class RedditTelegramBot:
         keyboard = []
         for group_id, group_info in self.groups.items():
             keyword_count = len(group_info['keywords'])
-            button_text = f"{group_info['name']} ({keyword_count} keywords)"
-            keyboard.append([InlineKeyboardButton(button_text, callback_data=f"select_group:{group_id}")])
+            status_icon = "✓" if group_info['enabled'] else "✗"
+            button_text = f"{status_icon} {group_info['name']} ({keyword_count} keywords)"
+            keyboard.append([InlineKeyboardButton(button_text, callback_data=f"manage_group:{group_id}")])
         
         reply_markup = InlineKeyboardMarkup(keyboard)
-        await update.message.reply_text("Select a group to manage keywords:", reply_markup=reply_markup)
+        await update.message.reply_text("Select a group to manage:", reply_markup=reply_markup)
     
     async def group_selection_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle group selection callback"""
+        """Handle group selection and menu interactions"""
         query = update.callback_query
         await query.answer()
         
         user_id = query.from_user.id
+        data = query.data
         
-        if not query.data.startswith("select_group:"):
-            await query.edit_message_text("Invalid selection")
-            return
+        # Main group management menu
+        if data.startswith("manage_group:"):
+            try:
+                group_id = int(data.split(":")[1])
+                
+                if group_id not in self.groups:
+                    await query.edit_message_text("Group not found")
+                    return
+                
+                group_info = self.groups[group_id]
+                keyword_count = len(group_info['keywords'])
+                status = "Enabled" if group_info['enabled'] else "Disabled"
+                
+                # Build menu
+                keyboard = [
+                    [InlineKeyboardButton("➕ Add Keywords", callback_data=f"add_kw:{group_id}")],
+                    [InlineKeyboardButton("➖ Remove Keywords", callback_data=f"remove_kw:{group_id}")],
+                    [InlineKeyboardButton("📋 List Keywords", callback_data=f"list_kw:{group_id}")],
+                    [InlineKeyboardButton("🗑️ Clear All Keywords", callback_data=f"clear_kw:{group_id}")],
+                    [InlineKeyboardButton(f"🔄 Toggle ({status})", callback_data=f"toggle:{group_id}")],
+                    [InlineKeyboardButton("« Back to Groups", callback_data="back_to_groups")]
+                ]
+                
+                reply_markup = InlineKeyboardMarkup(keyboard)
+                message = f"Managing: {group_info['name']}\n\n"
+                message += f"Status: {status}\n"
+                message += f"Keywords: {keyword_count}\n"
+                message += f"Group ID: {group_id}"
+                
+                await query.edit_message_text(message, reply_markup=reply_markup)
+                
+            except (ValueError, IndexError) as e:
+                logger.error(f"Error parsing callback data: {e}")
+                await query.edit_message_text("Error processing selection")
         
-        try:
-            group_id = int(query.data.split(":")[1])
-            
-            if group_id not in self.groups:
-                await query.edit_message_text("Group not found")
-                return
-            
-            # Store the selected group for this user
+        # Add keywords flow
+        elif data.startswith("add_kw:"):
+            group_id = int(data.split(":")[1])
             self.pending_keyword_add[user_id] = group_id
+            self.menu_state[user_id] = "adding_keywords"
             
             group_name = self.groups[group_id]['name']
             current_keywords = self.groups[group_id]['keywords']
             
-            keywords_text = "\n".join(f"  {kw}" for kw in sorted(current_keywords)) if current_keywords else "No keywords yet"
+            keywords_text = "\n  ".join(sorted(current_keywords)) if current_keywords else "None"
+            
+            keyboard = [[InlineKeyboardButton("« Cancel", callback_data=f"manage_group:{group_id}")]]
+            reply_markup = InlineKeyboardMarkup(keyboard)
             
             await query.edit_message_text(
-                f"Selected: {group_name}\n\n"
-                f"Current keywords:\n{keywords_text}\n\n"
-                f"Now send your keywords separated by commas.\n"
-                f"Example: pain killer, mutual fund, crypto news"
+                f"Adding keywords to: {group_name}\n\n"
+                f"Current keywords:\n  {keywords_text}\n\n"
+                f"Send your keywords separated by commas:\n"
+                f"Example: pain killer, mutual fund, crypto news",
+                reply_markup=reply_markup
             )
-        except (ValueError, IndexError) as e:
-            logger.error(f"Error parsing callback data: {e}")
-            await query.edit_message_text("Error processing selection")
+        
+        # Remove keywords flow
+        elif data.startswith("remove_kw:"):
+            group_id = int(data.split(":")[1])
+            
+            if not self.groups[group_id]['keywords']:
+                keyboard = [[InlineKeyboardButton("« Back", callback_data=f"manage_group:{group_id}")]]
+                reply_markup = InlineKeyboardMarkup(keyboard)
+                await query.edit_message_text(
+                    f"No keywords to remove from {self.groups[group_id]['name']}",
+                    reply_markup=reply_markup
+                )
+                return
+            
+            self.pending_keyword_remove[user_id] = group_id
+            self.menu_state[user_id] = "removing_keywords"
+            
+            group_name = self.groups[group_id]['name']
+            current_keywords = sorted(self.groups[group_id]['keywords'])
+            keywords_text = "\n  ".join(current_keywords)
+            
+            keyboard = [[InlineKeyboardButton("« Cancel", callback_data=f"manage_group:{group_id}")]]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            
+            await query.edit_message_text(
+                f"Removing keywords from: {group_name}\n\n"
+                f"Current keywords:\n  {keywords_text}\n\n"
+                f"Send keywords to remove (comma-separated):",
+                reply_markup=reply_markup
+            )
+        
+        # List keywords
+        elif data.startswith("list_kw:"):
+            group_id = int(data.split(":")[1])
+            group_info = self.groups[group_id]
+            keywords = sorted(group_info['keywords'])
+            
+            if not keywords:
+                keywords_text = "No keywords configured"
+            else:
+                keywords_text = "\n  ".join(keywords)
+            
+            keyboard = [[InlineKeyboardButton("« Back", callback_data=f"manage_group:{group_id}")]]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            
+            message = f"{group_info['name']}\n\n"
+            message += f"Keywords ({len(keywords)}):\n  {keywords_text}"
+            
+            await query.edit_message_text(message, reply_markup=reply_markup)
+        
+        # Clear all keywords
+        elif data.startswith("clear_kw:"):
+            group_id = int(data.split(":")[1])
+            
+            keyboard = [
+                [InlineKeyboardButton("✓ Yes, Clear All", callback_data=f"confirm_clear:{group_id}")],
+                [InlineKeyboardButton("✗ Cancel", callback_data=f"manage_group:{group_id}")]
+            ]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            
+            count = len(self.groups[group_id]['keywords'])
+            await query.edit_message_text(
+                f"Are you sure you want to clear all {count} keywords from {self.groups[group_id]['name']}?",
+                reply_markup=reply_markup
+            )
+        
+        # Confirm clear
+        elif data.startswith("confirm_clear:"):
+            group_id = int(data.split(":")[1])
+            count = len(self.groups[group_id]['keywords'])
+            self.groups[group_id]['keywords'].clear()
+            self.save_data()
+            
+            keyboard = [[InlineKeyboardButton("« Back", callback_data=f"manage_group:{group_id}")]]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            
+            await query.edit_message_text(
+                f"Cleared {count} keywords from {self.groups[group_id]['name']}",
+                reply_markup=reply_markup
+            )
+            logger.info(f"Cleared {count} keywords from group {group_id}")
+        
+        # Toggle group
+        elif data.startswith("toggle:"):
+            group_id = int(data.split(":")[1])
+            self.groups[group_id]['enabled'] = not self.groups[group_id]['enabled']
+            status = "enabled" if self.groups[group_id]['enabled'] else "disabled"
+            self.save_data()
+            
+            keyboard = [[InlineKeyboardButton("« Back", callback_data=f"manage_group:{group_id}")]]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            
+            await query.edit_message_text(
+                f"Group '{self.groups[group_id]['name']}' is now {status}",
+                reply_markup=reply_markup
+            )
+            logger.info(f"Group {group_id} {status}")
+        
+        # Back to groups list
+        elif data == "back_to_groups":
+            keyboard = []
+            for group_id, group_info in self.groups.items():
+                keyword_count = len(group_info['keywords'])
+                status_icon = "✓" if group_info['enabled'] else "✗"
+                button_text = f"{status_icon} {group_info['name']} ({keyword_count} keywords)"
+                keyboard.append([InlineKeyboardButton(button_text, callback_data=f"manage_group:{group_id}")])
+            
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            await query.edit_message_text("Select a group to manage:", reply_markup=reply_markup)
     
     async def handle_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle text messages for adding keywords after group selection"""
+        """Handle text messages for adding/removing keywords after menu selection"""
         user_id = update.effective_user.id
         chat_id = update.effective_chat.id
         
@@ -725,50 +866,99 @@ class RedditTelegramBot:
         if not self.is_owner(chat_id):
             return
         
-        # Check if user has a pending group selection
-        if user_id not in self.pending_keyword_add:
-            return
+        # Check menu state
+        menu_state = self.menu_state.get(user_id)
         
-        group_id = self.pending_keyword_add[user_id]
+        # Adding keywords
+        if user_id in self.pending_keyword_add and menu_state == "adding_keywords":
+            group_id = self.pending_keyword_add[user_id]
+            
+            # Parse comma-separated keywords
+            text = update.message.text
+            keywords = [kw.strip().lower() for kw in text.split(',') if kw.strip()]
+            
+            if not keywords:
+                await update.message.reply_text("No valid keywords found. Please try again.")
+                return
+            
+            # Add keywords to the selected group
+            added = []
+            skipped = []
+            
+            for keyword in keywords:
+                if keyword in self.groups[group_id]['keywords']:
+                    skipped.append(keyword)
+                else:
+                    self.groups[group_id]['keywords'].add(keyword)
+                    added.append(keyword)
+            
+            # Clear pending state
+            del self.pending_keyword_add[user_id]
+            del self.menu_state[user_id]
+            
+            self.save_data()
+            
+            # Format response with back button
+            response = f"Keywords added to '{self.groups[group_id]['name']}':\n\n"
+            
+            if added:
+                response += "Added:\n  " + "\n  ".join(added)
+            
+            if skipped:
+                response += "\n\nSkipped (already exists):\n  " + "\n  ".join(skipped)
+            
+            keyboard = [[InlineKeyboardButton("« Back to Group", callback_data=f"manage_group:{group_id}")]]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            
+            await update.message.reply_text(response, reply_markup=reply_markup)
+            logger.info(f"Added {len(added)} keywords to group {group_id}")
         
-        # Parse comma-separated keywords
-        text = update.message.text
-        keywords = [kw.strip().lower() for kw in text.split(',') if kw.strip()]
-        
-        if not keywords:
-            await update.message.reply_text("No valid keywords found. Please try again.")
-            return
-        
-        # Add keywords to the selected group
-        added = []
-        skipped = []
-        
-        for keyword in keywords:
-            if keyword in self.groups[group_id]['keywords']:
-                skipped.append(keyword)
-            else:
-                self.groups[group_id]['keywords'].add(keyword)
-                added.append(keyword)
-        
-        # Clear pending state
-        del self.pending_keyword_add[user_id]
-        
-        self.save_data()
-        
-        # Format response
-        response = f"Keywords added to '{self.groups[group_id]['name']}':\n\n"
-        
-        if added:
-            response += "Added:\n" + "\n".join(f"  {kw}" for kw in added)
-        
-        if skipped:
-            response += "\n\nSkipped (already exists):\n" + "\n".join(f"  {kw}" for kw in skipped)
-        
-        await update.message.reply_text(response)
-        logger.info(f"Added {len(added)} keywords to group {group_id}")
+        # Removing keywords
+        elif user_id in self.pending_keyword_remove and menu_state == "removing_keywords":
+            group_id = self.pending_keyword_remove[user_id]
+            
+            # Parse comma-separated keywords
+            text = update.message.text
+            keywords = [kw.strip().lower() for kw in text.split(',') if kw.strip()]
+            
+            if not keywords:
+                await update.message.reply_text("No valid keywords found. Please try again.")
+                return
+            
+            # Remove keywords from the selected group
+            removed = []
+            not_found = []
+            
+            for keyword in keywords:
+                if keyword in self.groups[group_id]['keywords']:
+                    self.groups[group_id]['keywords'].remove(keyword)
+                    removed.append(keyword)
+                else:
+                    not_found.append(keyword)
+            
+            # Clear pending state
+            del self.pending_keyword_remove[user_id]
+            del self.menu_state[user_id]
+            
+            self.save_data()
+            
+            # Format response with back button
+            response = f"Keywords removed from '{self.groups[group_id]['name']}':\n\n"
+            
+            if removed:
+                response += "Removed:\n  " + "\n  ".join(removed)
+            
+            if not_found:
+                response += "\n\nNot found:\n  " + "\n  ".join(not_found)
+            
+            keyboard = [[InlineKeyboardButton("« Back to Group", callback_data=f"manage_group:{group_id}")]]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            
+            await update.message.reply_text(response, reply_markup=reply_markup)
+            logger.info(f"Removed {len(removed)} keywords from group {group_id}")
     
-    async def remove_keyword_cmd(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Remove keywords from a group (Owner only)"""
+    async def addkeyword(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Add keywords to a group via direct command (Owner only)"""
         chat_id = update.effective_chat.id
         
         if not self.is_owner(chat_id):
@@ -776,7 +966,69 @@ class RedditTelegramBot:
             return
         
         if not context.args or len(context.args) < 2:
-            await update.message.reply_text("Usage: /removekeyword <group_id> <keyword1>, <keyword2>, ...\nExample: /removekeyword -1001234567890 pain killer, crypto")
+            await update.message.reply_text(
+                "Usage: /addkeyword <group_id> <keyword1>, <keyword2>, ...\n"
+                "Example: /addkeyword -1001234567890 pain killer, mutual fund\n\n"
+                "Tip: You can also use /group menu for interactive keyword management"
+            )
+            return
+        
+        try:
+            group_id = int(context.args[0])
+            keywords_text = ' '.join(context.args[1:])
+            keywords = [kw.strip().lower() for kw in keywords_text.split(',') if kw.strip()]
+            
+            if group_id not in self.groups:
+                await update.message.reply_text(f"Group {group_id} not found. Use /listgroups to see available groups.")
+                return
+            
+            if not keywords:
+                await update.message.reply_text("No valid keywords provided.")
+                return
+            
+            added = []
+            skipped = []
+            
+            for keyword in keywords:
+                if keyword in self.groups[group_id]['keywords']:
+                    skipped.append(keyword)
+                else:
+                    self.groups[group_id]['keywords'].add(keyword)
+                    added.append(keyword)
+            
+            self.save_data()
+            
+            response = f"Keywords added to '{self.groups[group_id]['name']}':\n\n"
+            
+            if added:
+                response += "Added:\n  " + "\n  ".join(added)
+            
+            if skipped:
+                response += "\n\nSkipped (already exists):\n  " + "\n  ".join(skipped)
+            
+            await update.message.reply_text(response)
+            logger.info(f"Added {len(added)} keywords to group {group_id} via direct command")
+            
+        except ValueError:
+            await update.message.reply_text("Invalid group ID. Please provide a valid numeric group chat ID.")
+        except Exception as e:
+            logger.error(f"Error adding keywords: {e}")
+            await update.message.reply_text(f"Error adding keywords: {e}")
+    
+    async def remove_keyword_cmd(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Remove keywords from a group via direct command (Owner only)"""
+        chat_id = update.effective_chat.id
+        
+        if not self.is_owner(chat_id):
+            await update.message.reply_text("You don't have permission to use this command. Please contact the bot owner.")
+            return
+        
+        if not context.args or len(context.args) < 2:
+            await update.message.reply_text(
+                "Usage: /removekeyword <group_id> <keyword1>, <keyword2>, ...\n"
+                "Example: /removekeyword -1001234567890 pain killer, crypto\n\n"
+                "Tip: You can also use /group menu for interactive keyword management"
+            )
             return
         
         try:
@@ -987,9 +1239,17 @@ Group Management:
 /listgroups - List all monitored groups
 /togglegroup <group_id> - Enable/disable a group
 
-Keyword Management:
-/group - Select a group and add keywords
-   Then send: keyword1, keyword2, keyword3
+Keyword Management (Two Methods):
+
+Interactive Menu (Recommended):
+/group - Opens interactive menu to manage groups
+   • Select group
+   • Add/Remove keywords via buttons
+   • List, clear, or toggle group
+   • No need to remember group IDs
+
+Direct Commands (Advanced):
+/addkeyword <group_id> keyword1, keyword2 - Add keywords directly
 /removekeyword <group_id> keyword1, keyword2 - Remove keywords
 /listkeywords <group_id> - List keywords for a group
 /cleargroup <group_id> - Clear all keywords from a group
@@ -1006,11 +1266,14 @@ Features:
 • Multi-group support with separate keywords
 • Rate limiting and error recovery
 
-Example Workflow:
-1. /addgroup -1001234567890 Marketing Team
-2. /group (select the group)
-3. Send: pain killer, mutual fund, crypto news
-4. Bot will monitor and send alerts to that group
+Example - Interactive Menu:
+1. /group
+2. Click "Marketing Team"
+3. Click "Add Keywords"
+4. Send: pain killer, mutual fund, crypto news
+
+Example - Direct Command:
+/addkeyword -1001234567890 pain killer, mutual fund
 
 Note: Other groups can only receive alerts. All management is done from this control group.
             """
@@ -1060,6 +1323,7 @@ For assistance, please contact the bot owner.
         app.add_handler(CommandHandler("addgroup", self.addgroup))
         app.add_handler(CommandHandler("removegroup", self.removegroup))
         app.add_handler(CommandHandler("group", self.group))
+        app.add_handler(CommandHandler("addkeyword", self.addkeyword))
         app.add_handler(CommandHandler("removekeyword", self.remove_keyword_cmd))
         app.add_handler(CommandHandler("listgroups", self.listgroups))
         app.add_handler(CommandHandler("listkeywords", self.listkeywords))
