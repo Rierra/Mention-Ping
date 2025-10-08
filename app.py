@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
-Reddit to Telegram Monitor Bot - Optimized Version
-Focuses on real-time streaming with improved search strategies
+Reddit to Telegram Monitor Bot - Multi-Group Version (Fixed)
+Monitors Reddit comprehensively for keywords in BOTH posts and comments
+Owner controls all groups from main control group
 """
 
 import os
@@ -12,16 +13,18 @@ import asyncio
 import re
 import aiohttp
 import html
-from typing import Set, List, Dict
+from typing import Set, List, Dict, Optional
 from datetime import datetime, timedelta
 
 import asyncpraw
-from telegram import Update
-from telegram.ext import Application, CommandHandler, ContextTypes
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Application, CommandHandler, ContextTypes, CallbackQueryHandler
 from dotenv import load_dotenv
 
+# Load environment variables from .env file
 load_dotenv()
 
+# Configure logging
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     level=logging.INFO
@@ -32,75 +35,123 @@ class RedditTelegramBot:
     def __init__(self):
         # Load configuration from environment variables
         self.telegram_token = os.getenv('TELEGRAM_BOT_TOKEN')
-        self.telegram_chat_id = os.getenv('TELEGRAM_CHAT_ID')
+        self.telegram_chat_id = os.getenv('TELEGRAM_CHAT_ID')  # Owner's control group
+        self.owner_chat_id = int(self.telegram_chat_id)  # Store as int for comparison
         
         self.reddit_client_id = os.getenv('REDDIT_CLIENT_ID')
         self.reddit_client_secret = os.getenv('REDDIT_CLIENT_SECRET')
         self.reddit_user_agent = os.getenv('REDDIT_USER_AGENT', 'TelegramBot:v1.0')
         
+        # Optional Reddit credentials for higher rate limits
         self.reddit_username = os.getenv('REDDIT_USERNAME', '')
         self.reddit_password = os.getenv('REDDIT_PASSWORD', '')
         
-        # Optimized configuration
-        self.check_interval = int(os.getenv('CHECK_INTERVAL', '600'))  # 10 minutes for search
-        self.search_limit = int(os.getenv('SEARCH_LIMIT', '100'))
-        self.search_time_filter = os.getenv('SEARCH_TIME_FILTER', 'hour')  # Changed to 'hour' for reliability
+        # Configuration
+        self.check_interval = int(os.getenv('CHECK_INTERVAL', '300'))  # seconds
+        self.search_limit = int(os.getenv('SEARCH_LIMIT', '100'))  # results per keyword
+        self.search_time_filter = os.getenv('SEARCH_TIME_FILTER', 'hour')  # hour, day, week, month, year, all
         
-        # Data storage
-        self.keywords: Set[str] = set()
-        self.processed_items: Set[str] = set()
-        self.last_search_time: Dict[str, float] = {}
+        # Multi-group data storage
+        self.groups: Dict[int, Dict] = {}  # group_id -> {name: str, keywords: set, enabled: bool}
+        self.processed_items: Dict[int, Set[str]] = {}  # group_id -> set of processed item IDs
+        self.last_search_time: Dict[str, float] = {}  # "group_id:keyword" -> timestamp
+        
+        # Temporary state for adding keywords
+        self.pending_keyword_add: Dict[int, int] = {}  # user_id -> selected_group_id
+        
         self.data_file = 'bot_data.json'
         
         # Rate limiting for notifications
-        self.notification_delay = 2
+        self.notification_delay = 3  # seconds between notifications
         self.pending_notifications = []
+        self.notification_lock = asyncio.Lock()
         
         # Sessions
-        self.telegram_session = None
-        self.reddit_session = None
-        self.reddit = None
+        self.telegram_session: Optional[aiohttp.ClientSession] = None
+        self.reddit_session: Optional[aiohttp.ClientSession] = None
+        self.reddit: Optional[asyncpraw.Reddit] = None
         
-        # Stream control
-        self.stream_task = None
+        # Background tasks
+        self.stream_task: Optional[asyncio.Task] = None
+        self.notification_task: Optional[asyncio.Task] = None
         self.stop_stream = False
+        self.stop_notification_processor = False
         
-        # Statistics
-        self.stats = {
-            'stream_comments_checked': 0,
-            'stream_matches_found': 0,
-            'search_posts_checked': 0,
-            'search_matches_found': 0,
-            'last_stream_comment': None,
-            'stream_start_time': None
-        }
+        # Rate limiting for Reddit API
+        self.last_reddit_request = 0
+        self.reddit_request_delay = 2  # seconds between requests
         
         self.load_data()
 
     def load_data(self):
-        """Load keywords and processed items from file"""
+        """Load groups, keywords and processed items from file"""
         try:
             if os.path.exists(self.data_file):
                 with open(self.data_file, 'r') as f:
                     data = json.load(f)
-                    self.keywords = set(data.get('keywords', []))
-                    self.processed_items = set(data.get('processed_items', []))
+                    
+                    # Load groups with keywords as sets
+                    groups_data = data.get('groups', {})
+                    self.groups = {}
+                    for group_id_str, group_info in groups_data.items():
+                        group_id = int(group_id_str)
+                        self.groups[group_id] = {
+                            'name': group_info.get('name', f'Group {group_id}'),
+                            'keywords': set(group_info.get('keywords', [])),
+                            'enabled': group_info.get('enabled', True)
+                        }
+                    
+                    # Load processed items per group
+                    processed_data = data.get('processed_items', {})
+                    self.processed_items = {}
+                    for group_id_str, items in processed_data.items():
+                        self.processed_items[int(group_id_str)] = set(items)
+                    
                     self.last_search_time = data.get('last_search_time', {})
-                    logger.info(f"Loaded {len(self.keywords)} keywords and {len(self.processed_items)} processed items")
+                    
+                    # Ensure owner's group exists
+                    if self.owner_chat_id not in self.groups:
+                        self.groups[self.owner_chat_id] = {
+                            'name': 'Control Group (Owner)',
+                            'keywords': set(),
+                            'enabled': True
+                        }
+                    
+                    total_keywords = sum(len(g['keywords']) for g in self.groups.values())
+                    logger.info(f"Loaded {len(self.groups)} groups with {total_keywords} total keywords")
             else:
-                logger.info("No existing data file found, starting fresh")
+                # Initialize with owner's group
+                self.groups = {
+                    self.owner_chat_id: {
+                        'name': 'Control Group (Owner)',
+                        'keywords': set(),
+                        'enabled': True
+                    }
+                }
+                self.processed_items = {}
+                self.last_search_time = {}
+                logger.info("No existing data file found, starting fresh with owner's group")
         except Exception as e:
             logger.error(f"Error loading data: {e}")
-            self.keywords = set()
-            self.processed_items = set()
+            self.groups = {
+                self.owner_chat_id: {
+                    'name': 'Control Group (Owner)',
+                    'keywords': set(),
+                    'enabled': True
+                }
+            }
+            self.processed_items = {}
             self.last_search_time = {}
 
     async def setup_reddit(self):
         """Initialize Reddit API client"""
         try:
-            if not self.reddit_session or self.reddit_session.closed:
-                timeout = aiohttp.ClientTimeout(total=30, connect=10)
-                self.reddit_session = aiohttp.ClientSession(timeout=timeout)
+            # Close existing session if any
+            if self.reddit_session and not self.reddit_session.closed:
+                await self.reddit_session.close()
+            
+            timeout = aiohttp.ClientTimeout(total=30, connect=10)
+            self.reddit_session = aiohttp.ClientSession(timeout=timeout)
             
             if self.reddit_username and self.reddit_password:
                 self.reddit = asyncpraw.Reddit(
@@ -126,25 +177,51 @@ class RedditTelegramBot:
             raise
     
     def save_data(self):
-        """Save keywords and processed items to file"""
+        """Save groups, keywords and processed items to file"""
         try:
-            # Limit processed items to prevent file growth (keep last 24 hours worth)
-            if len(self.processed_items) > 50000:
-                self.processed_items = set(list(self.processed_items)[-25000:])
-                logger.info("Trimmed processed_items to 25000 most recent")
-                
+            # Trim processed items during save
+            for group_id in list(self.processed_items.keys()):
+                if len(self.processed_items[group_id]) > 10000:
+                    self.processed_items[group_id] = set(list(self.processed_items[group_id])[-5000:])
+            
+            # Convert groups data to JSON-serializable format
+            groups_data = {}
+            for group_id, group_info in self.groups.items():
+                groups_data[str(group_id)] = {
+                    'name': group_info['name'],
+                    'keywords': list(group_info['keywords']),
+                    'enabled': group_info['enabled']
+                }
+            
+            # Convert processed items to JSON-serializable format
+            processed_data = {}
+            for group_id, items in self.processed_items.items():
+                processed_data[str(group_id)] = list(items)
+            
             data = {
-                'keywords': list(self.keywords),
-                'processed_items': list(self.processed_items),
+                'groups': groups_data,
+                'processed_items': processed_data,
                 'last_search_time': self.last_search_time
             }
+            
             with open(self.data_file, 'w') as f:
                 json.dump(data, f, indent=2)
         except Exception as e:
             logger.error(f"Error saving data: {e}")
     
+    def trim_processed_items_in_memory(self):
+        """Trim processed items during runtime to prevent memory growth"""
+        for group_id in list(self.processed_items.keys()):
+            if len(self.processed_items[group_id]) > 15000:
+                logger.info(f"Trimming processed items for group {group_id}")
+                self.processed_items[group_id] = set(list(self.processed_items[group_id])[-7500:])
+    
+    def is_owner(self, chat_id: int) -> bool:
+        """Check if the chat is the owner's control group"""
+        return chat_id == self.owner_chat_id
+    
     def contains_phrase(self, text: str, phrase: str) -> bool:
-        """Check if text contains the exact phrase (case-insensitive, word boundaries)"""
+        """Check if text contains the exact phrase (case-insensitive)"""
         if not text or not phrase:
             return False
         pattern = r'\b' + re.escape(phrase.lower()) + r'\b'
@@ -159,12 +236,12 @@ class RedditTelegramBot:
                 
                 try:
                     if hasattr(item, 'selftext') and item.selftext:
-                        content = item.selftext[:400] + "..." if len(item.selftext) > 400 else item.selftext
+                        content = item.selftext[:500] + "..." if len(item.selftext) > 500 else item.selftext
                 except AttributeError:
                     pass
                 
-                message = f"[POST] Keyword: {keyword}\n\n"
-                message += f"Title: {title}\n"
+                message = f"Keyword: {keyword}\n\n"
+                message += f"Post: {title}\n"
                 message += f"By: u/{item.author}\n"
                 message += f"Subreddit: r/{item.subreddit}\n"
                 
@@ -178,12 +255,12 @@ class RedditTelegramBot:
                 
                 try:
                     if hasattr(item, 'body') and item.body:
-                        content = item.body[:400] + "..." if len(item.body) > 400 else item.body
+                        content = item.body[:500] + "..." if len(item.body) > 500 else item.body
                 except AttributeError:
                     pass
                 
-                message = f"[COMMENT] Keyword: {keyword}\n\n"
-                message += f"By: u/{item.author}\n"
+                message = f"Keyword: {keyword}\n\n"
+                message += f"Comment by: u/{item.author}\n"
                 message += f"Subreddit: r/{item.subreddit}\n"
                 
                 if content:
@@ -193,31 +270,50 @@ class RedditTelegramBot:
                 
         except AttributeError as e:
             logger.error(f"Error formatting notification: {e}")
-            message = f"[{item_type.upper()}] Keyword: {keyword}\n\nError formatting item details."
+            message = f"Keyword: {keyword}\n\nError formatting item details."
         
         return message
     
-    async def send_notification(self, message: str):
-        """Queue notification to be sent with rate limiting"""
-        self.pending_notifications.append(message)
+    async def send_notification_to_group(self, group_id: int, message: str):
+        """Queue notification to be sent to specific group with rate limiting"""
+        async with self.notification_lock:
+            self.pending_notifications.append((group_id, message))
+            logger.info(f"Queued notification for group {group_id}, {len(self.pending_notifications)} in queue")
     
-    async def process_notifications(self):
-        """Process queued notifications with rate limiting"""
-        while self.pending_notifications:
+    async def notification_processor(self):
+        """Continuously process queued notifications with rate limiting"""
+        logger.info("Notification processor started")
+        
+        while not self.stop_notification_processor:
             try:
-                message = self.pending_notifications.pop(0)
-                await self._send_telegram_message(message)
+                async with self.notification_lock:
+                    if self.pending_notifications:
+                        group_id, message = self.pending_notifications.pop(0)
+                    else:
+                        group_id, message = None, None
                 
-                if self.pending_notifications:
-                    await asyncio.sleep(self.notification_delay)
+                if group_id is not None:
+                    try:
+                        await self._send_telegram_message(group_id, message)
+                        logger.info(f"Notification sent to group {group_id} successfully")
+                        await asyncio.sleep(self.notification_delay)
+                    except Exception as e:
+                        logger.error(f"Error sending notification: {e}")
+                        # Re-queue the failed notification
+                        async with self.notification_lock:
+                            self.pending_notifications.insert(0, (group_id, message))
+                        await asyncio.sleep(self.notification_delay * 2)
+                else:
+                    # No notifications, sleep briefly
+                    await asyncio.sleep(1)
                     
             except Exception as e:
-                logger.error(f"Error processing notification: {e}")
-                self.pending_notifications.insert(0, message)
-                await asyncio.sleep(self.notification_delay * 2)
-                break
+                logger.error(f"Error in notification processor: {e}")
+                await asyncio.sleep(5)
+        
+        logger.info("Notification processor stopped")
     
-    async def _send_telegram_message(self, message: str):
+    async def _send_telegram_message(self, chat_id: int, message: str):
         """Send a single message to Telegram"""
         try:
             if not self.telegram_session or self.telegram_session.closed:
@@ -226,7 +322,7 @@ class RedditTelegramBot:
                 
             url = f"https://api.telegram.org/bot{self.telegram_token}/sendMessage"
             data = {
-                'chat_id': self.telegram_chat_id,
+                'chat_id': chat_id,
                 'text': message,
                 'parse_mode': 'HTML',
                 'disable_web_page_preview': True
@@ -252,73 +348,120 @@ class RedditTelegramBot:
             logger.error(f"Error sending notification: {e}")
             raise
 
-    async def search_with_multiple_sorts(self, keyword: str):
-        """Search posts using multiple sort methods to catch more results"""
+    async def rate_limit_reddit_request(self):
+        """Ensure proper spacing between Reddit API requests"""
+        current_time = time.time()
+        time_since_last = current_time - self.last_reddit_request
+        
+        if time_since_last < self.reddit_request_delay:
+            await asyncio.sleep(self.reddit_request_delay - time_since_last)
+        
+        self.last_reddit_request = time.time()
+
+    async def search_posts(self, group_id: int, keyword: str):
+        """Search Reddit posts for keyword for a specific group"""
         try:
-            logger.info(f"Multi-sort search for keyword: {keyword}")
+            logger.info(f"Searching posts for keyword: {keyword} (Group: {group_id})")
+            
+            # Initialize processed items set for this group if not exists
+            if group_id not in self.processed_items:
+                self.processed_items[group_id] = set()
+            
+            await self.rate_limit_reddit_request()
             
             subreddit = await self.reddit.subreddit('all')
             new_matches = 0
-            sort_methods = ['new', 'hot', 'relevance']
             
-            for sort_method in sort_methods:
+            async for post in subreddit.search(
+                keyword, 
+                sort='new', 
+                time_filter=self.search_time_filter, 
+                limit=self.search_limit
+            ):
                 try:
-                    async for post in subreddit.search(
-                        keyword, 
-                        sort=sort_method, 
-                        time_filter=self.search_time_filter, 
-                        limit=self.search_limit
-                    ):
-                        try:
-                            if post.id in self.processed_items:
-                                continue
-                            
-                            self.stats['search_posts_checked'] += 1
-                            
-                            # Check title and body
-                            title_match = self.contains_phrase(post.title, keyword)
-                            body_match = False
-                            
-                            try:
-                                if hasattr(post, 'selftext') and post.selftext:
-                                    body_match = self.contains_phrase(post.selftext, keyword)
-                            except AttributeError:
-                                pass
-
-                            if title_match or body_match:
-                                new_matches += 1
-                                self.stats['search_matches_found'] += 1
-                                message = self.format_notification(post, keyword, "post")
-                                await self.send_notification(message)
-                                self.processed_items.add(post.id)
-                                logger.info(f"Found post match (sort={sort_method}): {post.id}")
-                            
-                            await asyncio.sleep(0.05)
-                            
-                        except Exception as e:
-                            logger.error(f"Error processing post: {e}")
-                            continue
+                    if post.id in self.processed_items[group_id]:
+                        continue
                     
-                    await asyncio.sleep(1)  # Delay between sort methods
+                    # Validate exact phrase match
+                    title_match = self.contains_phrase(post.title, keyword)
+                    body_match = False
+                    
+                    try:
+                        if hasattr(post, 'selftext') and post.selftext:
+                            body_match = self.contains_phrase(post.selftext, keyword)
+                    except AttributeError:
+                        pass
+
+                    if title_match or body_match:
+                        new_matches += 1
+                        message = self.format_notification(post, keyword, "post")
+                        await self.send_notification_to_group(group_id, message)
+                        self.processed_items[group_id].add(post.id)
+                        logger.info(f"Found matching post: {post.id} for group {group_id}")
+                    
+                    await asyncio.sleep(0.1)
                     
                 except Exception as e:
-                    logger.error(f"Error with sort method {sort_method}: {e}")
+                    logger.error(f"Error processing post: {e}")
                     continue
             
-            logger.info(f"Multi-sort search for '{keyword}': {new_matches} new matches")
-            return new_matches
+            logger.info(f"Post search for '{keyword}' (Group {group_id}): {new_matches} new matches")
             
         except Exception as e:
-            logger.error(f"Error in multi-sort search for '{keyword}': {e}")
-            return 0
+            logger.error(f"Error searching posts for '{keyword}' (Group {group_id}): {e}")
+
+    async def search_comments_via_posts(self, group_id: int, keyword: str):
+        """Search for comments by finding recent posts and checking their comments"""
+        try:
+            logger.info(f"Searching comments (via posts) for keyword: {keyword} (Group: {group_id})")
+            
+            if group_id not in self.processed_items:
+                self.processed_items[group_id] = set()
+            
+            await self.rate_limit_reddit_request()
+            
+            subreddit = await self.reddit.subreddit('all')
+            new_matches = 0
+            
+            # Get recent posts to check their comments
+            async for post in subreddit.new(limit=self.search_limit):
+                try:
+                    if post.num_comments == 0:
+                        continue
+                    
+                    # Expand comments
+                    await post.comments.replace_more(limit=0)
+                    
+                    for comment in post.comments.list():
+                        try:
+                            if comment.id in self.processed_items[group_id]:
+                                continue
+                            
+                            if hasattr(comment, 'body') and self.contains_phrase(comment.body, keyword):
+                                new_matches += 1
+                                message = self.format_notification(comment, keyword, "comment")
+                                await self.send_notification_to_group(group_id, message)
+                                self.processed_items[group_id].add(comment.id)
+                                logger.info(f"Found matching comment: {comment.id} for group {group_id}")
+                            
+                        except Exception as e:
+                            logger.error(f"Error processing comment: {e}")
+                            continue
+                    
+                    await asyncio.sleep(0.5)
+                    
+                except Exception as e:
+                    logger.error(f"Error processing post comments: {e}")
+                    continue
+            
+            logger.info(f"Comment search (via posts) for '{keyword}' (Group {group_id}): {new_matches} new matches")
+            
+        except Exception as e:
+            logger.error(f"Error searching comments via posts for '{keyword}' (Group {group_id}): {e}")
 
     async def stream_comments(self):
-        """Stream new comments from Reddit in real-time - PRIMARY monitoring method"""
-        logger.info("Starting comment stream (primary monitoring method)...")
-        self.stats['stream_start_time'] = datetime.now()
-        
-        consecutive_errors = 0
-        max_consecutive_errors = 5
+        """Stream new comments from Reddit in real-time for all groups"""
+        logger.info("Starting comment stream...")
         
         while not self.stop_stream:
             try:
@@ -326,112 +469,106 @@ class RedditTelegramBot:
                     await self.setup_reddit()
                 
                 subreddit = await self.reddit.subreddit('all')
-                logger.info("Comment stream connected to r/all")
-                consecutive_errors = 0  # Reset on successful connection
                 
                 async for comment in subreddit.stream.comments(skip_existing=True):
                     if self.stop_stream:
                         break
                     
                     try:
-                        self.stats['stream_comments_checked'] += 1
-                        self.stats['last_stream_comment'] = datetime.now()
-                        
-                        # Skip if already processed
-                        if comment.id in self.processed_items:
-                            continue
-                        
-                        # Check against all keywords
-                        for keyword in list(self.keywords):
-                            if hasattr(comment, 'body') and self.contains_phrase(comment.body, keyword):
-                                self.stats['stream_matches_found'] += 1
-                                message = self.format_notification(comment, keyword, "comment")
-                                await self.send_notification(message)
-                                self.processed_items.add(comment.id)
-                                logger.info(f"Stream match: comment {comment.id} for keyword '{keyword}'")
-                                break
-                        
-                        # Process notifications periodically
-                        if len(self.pending_notifications) >= 10:
-                            await self.process_notifications()
-                        
-                        # Periodic save every 1000 comments
-                        if self.stats['stream_comments_checked'] % 1000 == 0:
-                            self.save_data()
-                            logger.info(f"Stream stats: {self.stats['stream_comments_checked']} checked, {self.stats['stream_matches_found']} matches")
+                        # Check against all groups and their keywords
+                        for group_id, group_info in self.groups.items():
+                            if not group_info['enabled']:
+                                continue
+                            
+                            if group_id not in self.processed_items:
+                                self.processed_items[group_id] = set()
+                            
+                            # Skip if already processed for this group
+                            if comment.id in self.processed_items[group_id]:
+                                continue
+                            
+                            # Check against all keywords for this group
+                            for keyword in list(group_info['keywords']):
+                                if hasattr(comment, 'body') and self.contains_phrase(comment.body, keyword):
+                                    message = self.format_notification(comment, keyword, "comment")
+                                    await self.send_notification_to_group(group_id, message)
+                                    self.processed_items[group_id].add(comment.id)
+                                    logger.info(f"Stream found matching comment: {comment.id} for group {group_id}, keyword: {keyword}")
+                                    break  # Only notify once per comment per group
                         
                     except Exception as e:
                         logger.error(f"Error processing streamed comment: {e}")
                         continue
                 
             except Exception as e:
-                consecutive_errors += 1
-                logger.error(f"Error in comment stream (attempt {consecutive_errors}/{max_consecutive_errors}): {e}")
-                
-                if consecutive_errors >= max_consecutive_errors:
-                    logger.error("Too many consecutive stream errors, waiting longer before retry")
-                    await asyncio.sleep(300)  # 5 minute cooldown
-                    consecutive_errors = 0
-                else:
-                    await asyncio.sleep(30)
-                
-                # Clean up and reconnect
+                logger.error(f"Error in comment stream: {e}")
+                # Try to recover
                 if self.reddit:
                     try:
                         await self.reddit.close()
                     except:
                         pass
                     self.reddit = None
+                await asyncio.sleep(30)  # Wait before retrying
     
-    async def search_keyword(self, keyword: str):
-        """Search using multiple methods - SUPPLEMENTARY to stream"""
+    async def search_keyword_for_group(self, group_id: int, keyword: str):
+        """Comprehensive search for a keyword in both posts and comments for a specific group"""
         try:
             if not self.reddit:
                 await self.setup_reddit()
             
-            logger.info(f"Starting supplementary search for: {keyword}")
+            logger.info(f"Starting comprehensive search for: {keyword} (Group: {group_id})")
             
-            # Use multi-sort search for better coverage
-            await self.search_with_multiple_sorts(keyword)
+            # Search posts
+            await self.search_posts(group_id, keyword)
+            
+            # Search comments via recent posts
+            await self.search_comments_via_posts(group_id, keyword)
             
             # Update last search time
-            self.last_search_time[keyword] = time.time()
+            search_key = f"{group_id}:{keyword}"
+            self.last_search_time[search_key] = time.time()
             
-            logger.info(f"Completed supplementary search for: {keyword}")
+            logger.info(f"Completed search for: {keyword} (Group: {group_id})")
             
         except Exception as e:
-            logger.error(f"Error in supplementary search for '{keyword}': {e}")
+            logger.error(f"Error in comprehensive search for '{keyword}' (Group {group_id}): {e}")
+            # Don't re-raise, continue with other keywords
     
     async def monitor_reddit(self):
-        """Supplementary search monitoring (stream is primary)"""
-        if not self.keywords:
-            logger.info("No keywords to search for")
-            return
-        
+        """Monitor Reddit for keyword matches using search for all groups"""
         try:
             if not self.reddit:
                 await self.setup_reddit()
             
-            logger.info(f"Starting supplementary search for {len(self.keywords)} keywords...")
+            total_keywords = sum(len(g['keywords']) for g in self.groups.values() if g['enabled'])
+            if total_keywords == 0:
+                logger.info("No keywords to monitor across all groups")
+                return
             
-            for keyword in list(self.keywords):
-                try:
-                    await self.search_keyword(keyword)
-                    await asyncio.sleep(2)
-                    
-                except Exception as e:
-                    logger.error(f"Error processing keyword '{keyword}': {e}")
+            logger.info(f"Starting search for {total_keywords} keywords across {len(self.groups)} groups...")
+            
+            for group_id, group_info in self.groups.items():
+                if not group_info['enabled']:
                     continue
+                
+                for keyword in list(group_info['keywords']):
+                    try:
+                        await self.search_keyword_for_group(group_id, keyword)
+                        
+                    except Exception as e:
+                        logger.error(f"Error processing keyword '{keyword}' for group {group_id}: {e}")
+                        continue
             
-            # Process any queued notifications
-            await self.process_notifications()
+            # Trim processed items in memory if needed
+            self.trim_processed_items_in_memory()
             
             self.save_data()
             
             logger.info("Search cycle completed")
             
         except Exception as e:
-            logger.error(f"Error in supplementary monitoring: {e}")
+            logger.error(f"Error monitoring Reddit: {e}")
             if self.reddit:
                 try:
                     await self.reddit.close()
@@ -439,130 +576,463 @@ class RedditTelegramBot:
                     pass
                 self.reddit = None
     
-    async def add_keyword(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Add a keyword to monitor"""
-        if not context.args:
-            await update.message.reply_text("Usage: /add <keyword or phrase>\nExample: /add pain killer")
-            return
-        
-        keyword = ' '.join(context.args).lower().strip()
-        
-        if keyword in self.keywords:
-            await update.message.reply_text(f"Already monitoring: {keyword}")
-            return
-        
-        self.keywords.add(keyword)
-        self.save_data()
-        await update.message.reply_text(
-            f"Added keyword: {keyword}\n\n"
-            f"Stream will catch this in real-time.\n"
-            f"Search will backfill recent content."
-        )
-        logger.info(f"Added keyword: {keyword}")
+    # ============= COMMAND HANDLERS =============
     
-    async def remove_keyword(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Remove a keyword from monitoring"""
-        if not context.args:
-            await update.message.reply_text("Usage: /remove <keyword or phrase>")
+    async def addgroup(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Add a new group to monitor (Owner only)"""
+        chat_id = update.effective_chat.id
+        
+        if not self.is_owner(chat_id):
+            await update.message.reply_text("You don't have permission to use this command. Please contact the bot owner.")
             return
         
-        keyword = ' '.join(context.args).lower().strip()
-        
-        if keyword not in self.keywords:
-            await update.message.reply_text(f"Not monitoring: {keyword}")
+        if not context.args or len(context.args) < 1:
+            await update.message.reply_text("Usage: /addgroup <group_chat_id> [group_name]\nExample: /addgroup -1001234567890 Marketing Team")
             return
         
-        self.keywords.remove(keyword)
-        if keyword in self.last_search_time:
-            del self.last_search_time[keyword]
-        self.save_data()
-        await update.message.reply_text(f"Removed keyword: {keyword}")
-        logger.info(f"Removed keyword: {keyword}")
+        try:
+            new_group_id = int(context.args[0])
+            group_name = ' '.join(context.args[1:]) if len(context.args) > 1 else f"Group {new_group_id}"
+            
+            if new_group_id in self.groups:
+                await update.message.reply_text(f"Group {new_group_id} is already being monitored as '{self.groups[new_group_id]['name']}'")
+                return
+            
+            self.groups[new_group_id] = {
+                'name': group_name,
+                'keywords': set(),
+                'enabled': True
+            }
+            
+            self.save_data()
+            await update.message.reply_text(f"Added group: {group_name} (ID: {new_group_id})\n\nYou can now add keywords for this group using /group command")
+            logger.info(f"Added new group: {group_name} ({new_group_id})")
+            
+        except ValueError:
+            await update.message.reply_text("Invalid group ID. Please provide a valid numeric group chat ID.")
+        except Exception as e:
+            logger.error(f"Error adding group: {e}")
+            await update.message.reply_text(f"Error adding group: {e}")
     
-    async def list_keywords(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """List all monitored keywords"""
-        if not self.keywords:
-            await update.message.reply_text("No keywords being monitored.")
+    async def removegroup(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Remove a group from monitoring (Owner only)"""
+        chat_id = update.effective_chat.id
+        
+        if not self.is_owner(chat_id):
+            await update.message.reply_text("You don't have permission to use this command. Please contact the bot owner.")
             return
         
-        keywords_list = '\n'.join(f"- {keyword}" for keyword in sorted(self.keywords))
-        message = f"Monitoring {len(self.keywords)} keywords:\n\n{keywords_list}"
+        if not context.args:
+            await update.message.reply_text("Usage: /removegroup <group_chat_id>")
+            return
+        
+        try:
+            group_id = int(context.args[0])
+            
+            if group_id == self.owner_chat_id:
+                await update.message.reply_text("Cannot remove the owner's control group")
+                return
+            
+            if group_id not in self.groups:
+                await update.message.reply_text(f"Group {group_id} is not being monitored.")
+                return
+            
+            group_name = self.groups[group_id]['name']
+            del self.groups[group_id]
+            
+            if group_id in self.processed_items:
+                del self.processed_items[group_id]
+            
+            # Clean up last_search_time entries for this group
+            keys_to_remove = [k for k in self.last_search_time.keys() if k.startswith(f"{group_id}:")]
+            for key in keys_to_remove:
+                del self.last_search_time[key]
+            
+            self.save_data()
+            await update.message.reply_text(f"Removed group: {group_name} (ID: {group_id})")
+            logger.info(f"Removed group: {group_name} ({group_id})")
+            
+        except ValueError:
+            await update.message.reply_text("Invalid group ID. Please provide a valid numeric group chat ID.")
+        except Exception as e:
+            logger.error(f"Error removing group: {e}")
+            await update.message.reply_text(f"Error removing group: {e}")
+    
+    async def group(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Select a group to add keywords to (Owner only)"""
+        chat_id = update.effective_chat.id
+        
+        if not self.is_owner(chat_id):
+            await update.message.reply_text("You don't have permission to use this command. Please contact the bot owner.")
+            return
+        
+        if not self.groups:
+            await update.message.reply_text("No groups available. Add a group first using /addgroup")
+            return
+        
+        # Create inline keyboard with all groups
+        keyboard = []
+        for group_id, group_info in self.groups.items():
+            keyword_count = len(group_info['keywords'])
+            button_text = f"{group_info['name']} ({keyword_count} keywords)"
+            keyboard.append([InlineKeyboardButton(button_text, callback_data=f"select_group:{group_id}")])
+        
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await update.message.reply_text("Select a group to manage keywords:", reply_markup=reply_markup)
+    
+    async def group_selection_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle group selection callback"""
+        query = update.callback_query
+        await query.answer()
+        
+        user_id = query.from_user.id
+        
+        if not query.data.startswith("select_group:"):
+            await query.edit_message_text("Invalid selection")
+            return
+        
+        try:
+            group_id = int(query.data.split(":")[1])
+            
+            if group_id not in self.groups:
+                await query.edit_message_text("Group not found")
+                return
+            
+            # Store the selected group for this user
+            self.pending_keyword_add[user_id] = group_id
+            
+            group_name = self.groups[group_id]['name']
+            current_keywords = self.groups[group_id]['keywords']
+            
+            keywords_text = "\n".join(f"  {kw}" for kw in sorted(current_keywords)) if current_keywords else "No keywords yet"
+            
+            await query.edit_message_text(
+                f"Selected: {group_name}\n\n"
+                f"Current keywords:\n{keywords_text}\n\n"
+                f"Now send your keywords separated by commas.\n"
+                f"Example: pain killer, mutual fund, crypto news"
+            )
+        except (ValueError, IndexError) as e:
+            logger.error(f"Error parsing callback data: {e}")
+            await query.edit_message_text("Error processing selection")
+    
+    async def handle_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle text messages for adding keywords after group selection"""
+        user_id = update.effective_user.id
+        chat_id = update.effective_chat.id
+        
+        # Only process in owner's group
+        if not self.is_owner(chat_id):
+            return
+        
+        # Check if user has a pending group selection
+        if user_id not in self.pending_keyword_add:
+            return
+        
+        group_id = self.pending_keyword_add[user_id]
+        
+        # Parse comma-separated keywords
+        text = update.message.text
+        keywords = [kw.strip().lower() for kw in text.split(',') if kw.strip()]
+        
+        if not keywords:
+            await update.message.reply_text("No valid keywords found. Please try again.")
+            return
+        
+        # Add keywords to the selected group
+        added = []
+        skipped = []
+        
+        for keyword in keywords:
+            if keyword in self.groups[group_id]['keywords']:
+                skipped.append(keyword)
+            else:
+                self.groups[group_id]['keywords'].add(keyword)
+                added.append(keyword)
+        
+        # Clear pending state
+        del self.pending_keyword_add[user_id]
+        
+        self.save_data()
+        
+        # Format response
+        response = f"Keywords added to '{self.groups[group_id]['name']}':\n\n"
+        
+        if added:
+            response += "Added:\n" + "\n".join(f"  {kw}" for kw in added)
+        
+        if skipped:
+            response += "\n\nSkipped (already exists):\n" + "\n".join(f"  {kw}" for kw in skipped)
+        
+        await update.message.reply_text(response)
+        logger.info(f"Added {len(added)} keywords to group {group_id}")
+    
+    async def remove_keyword_cmd(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Remove keywords from a group (Owner only)"""
+        chat_id = update.effective_chat.id
+        
+        if not self.is_owner(chat_id):
+            await update.message.reply_text("You don't have permission to use this command. Please contact the bot owner.")
+            return
+        
+        if not context.args or len(context.args) < 2:
+            await update.message.reply_text("Usage: /removekeyword <group_id> <keyword1>, <keyword2>, ...\nExample: /removekeyword -1001234567890 pain killer, crypto")
+            return
+        
+        try:
+            group_id = int(context.args[0])
+            keywords_text = ' '.join(context.args[1:])
+            keywords = [kw.strip().lower() for kw in keywords_text.split(',') if kw.strip()]
+            
+            if group_id not in self.groups:
+                await update.message.reply_text(f"Group {group_id} not found.")
+                return
+            
+            removed = []
+            not_found = []
+            
+            for keyword in keywords:
+                if keyword in self.groups[group_id]['keywords']:
+                    self.groups[group_id]['keywords'].remove(keyword)
+                    removed.append(keyword)
+                else:
+                    not_found.append(keyword)
+            
+            self.save_data()
+            
+            response = f"Keywords removed from '{self.groups[group_id]['name']}':\n\n"
+            
+            if removed:
+                response += "Removed:\n" + "\n".join(f"  {kw}" for kw in removed)
+            
+            if not_found:
+                response += "\n\nNot found:\n" + "\n".join(f"  {kw}" for kw in not_found)
+            
+            await update.message.reply_text(response)
+            logger.info(f"Removed {len(removed)} keywords from group {group_id}")
+            
+        except ValueError:
+            await update.message.reply_text("Invalid group ID. Please provide a valid numeric group chat ID.")
+        except Exception as e:
+            logger.error(f"Error removing keywords: {e}")
+            await update.message.reply_text(f"Error removing keywords: {e}")
+    
+    async def listgroups(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """List all monitored groups (Owner only)"""
+        chat_id = update.effective_chat.id
+        
+        if not self.is_owner(chat_id):
+            await update.message.reply_text("You don't have permission to use this command. Please contact the bot owner.")
+            return
+        
+        if not self.groups:
+            await update.message.reply_text("No groups being monitored.")
+            return
+        
+        message = "Monitored Groups:\n\n"
+        
+        for group_id, group_info in self.groups.items():
+            status = "[Active]" if group_info['enabled'] else "[Disabled]"
+            keyword_count = len(group_info['keywords'])
+            message += f"{status} {group_info['name']}\n"
+            message += f"   ID: {group_id}\n"
+            message += f"   Keywords: {keyword_count}\n\n"
+        
         await update.message.reply_text(message)
     
-    async def clear_keywords(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Clear all monitored keywords"""
-        count = len(self.keywords)
-        self.keywords.clear()
-        self.last_search_time.clear()
-        self.save_data()
-        await update.message.reply_text(f"Cleared {count} keywords.")
-        logger.info(f"Cleared {count} keywords")
+    async def listkeywords(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """List keywords for a specific group (Owner only)"""
+        chat_id = update.effective_chat.id
+        
+        if not self.is_owner(chat_id):
+            await update.message.reply_text("You don't have permission to use this command. Please contact the bot owner.")
+            return
+        
+        if not context.args:
+            await update.message.reply_text("Usage: /listkeywords <group_id>")
+            return
+        
+        try:
+            group_id = int(context.args[0])
+            
+            if group_id not in self.groups:
+                await update.message.reply_text(f"Group {group_id} not found.")
+                return
+            
+            group_info = self.groups[group_id]
+            keywords = sorted(group_info['keywords'])
+            
+            if not keywords:
+                await update.message.reply_text(f"{group_info['name']}\n\nNo keywords configured.")
+                return
+            
+            keywords_text = "\n".join(f"  {kw}" for kw in keywords)
+            message = f"{group_info['name']}\n\n"
+            message += f"Keywords ({len(keywords)}):\n{keywords_text}"
+            
+            await update.message.reply_text(message)
+            
+        except ValueError:
+            await update.message.reply_text("Invalid group ID. Please provide a valid numeric group chat ID.")
+        except Exception as e:
+            logger.error(f"Error listing keywords: {e}")
+            await update.message.reply_text(f"Error listing keywords: {e}")
+    
+    async def cleargroup(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Clear all keywords from a group (Owner only)"""
+        chat_id = update.effective_chat.id
+        
+        if not self.is_owner(chat_id):
+            await update.message.reply_text("You don't have permission to use this command. Please contact the bot owner.")
+            return
+        
+        if not context.args:
+            await update.message.reply_text("Usage: /cleargroup <group_id>")
+            return
+        
+        try:
+            group_id = int(context.args[0])
+            
+            if group_id not in self.groups:
+                await update.message.reply_text(f"Group {group_id} not found.")
+                return
+            
+            count = len(self.groups[group_id]['keywords'])
+            self.groups[group_id]['keywords'].clear()
+            self.save_data()
+            
+            await update.message.reply_text(f"Cleared {count} keywords from '{self.groups[group_id]['name']}'")
+            logger.info(f"Cleared {count} keywords from group {group_id}")
+            
+        except ValueError:
+            await update.message.reply_text("Invalid group ID. Please provide a valid numeric group chat ID.")
+        except Exception as e:
+            logger.error(f"Error clearing group keywords: {e}")
+            await update.message.reply_text(f"Error clearing group keywords: {e}")
+    
+    async def togglegroup(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Enable or disable a group (Owner only)"""
+        chat_id = update.effective_chat.id
+        
+        if not self.is_owner(chat_id):
+            await update.message.reply_text("You don't have permission to use this command. Please contact the bot owner.")
+            return
+        
+        if not context.args:
+            await update.message.reply_text("Usage: /togglegroup <group_id>")
+            return
+        
+        try:
+            group_id = int(context.args[0])
+            
+            if group_id not in self.groups:
+                await update.message.reply_text(f"Group {group_id} not found.")
+                return
+            
+            self.groups[group_id]['enabled'] = not self.groups[group_id]['enabled']
+            status = "enabled" if self.groups[group_id]['enabled'] else "disabled"
+            
+            self.save_data()
+            
+            await update.message.reply_text(f"Group '{self.groups[group_id]['name']}' is now {status}")
+            logger.info(f"Group {group_id} {status}")
+            
+        except ValueError:
+            await update.message.reply_text("Invalid group ID. Please provide a valid numeric group chat ID.")
+        except Exception as e:
+            logger.error(f"Error toggling group: {e}")
+            await update.message.reply_text(f"Error toggling group: {e}")
     
     async def status(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Show bot status with statistics"""
-        stream_running = self.stream_task and not self.stream_task.done()
+        """Show bot status (Owner only)"""
+        chat_id = update.effective_chat.id
+        
+        if not self.is_owner(chat_id):
+            await update.message.reply_text("You don't have permission to use this command. Please contact the bot owner.")
+            return
+        
+        total_keywords = sum(len(g['keywords']) for g in self.groups.values())
+        total_processed = sum(len(items) for items in self.processed_items.values())
+        enabled_groups = sum(1 for g in self.groups.values() if g['enabled'])
         
         status_msg = f"Bot Status:\n\n"
-        status_msg += f"Keywords: {len(self.keywords)}\n"
-        status_msg += f"Processed items: {len(self.processed_items)}\n"
-        status_msg += f"Pending notifications: {len(self.pending_notifications)}\n\n"
-        
-        status_msg += f"Configuration:\n"
-        status_msg += f"- Search interval: {self.check_interval}s\n"
-        status_msg += f"- Search time filter: {self.search_time_filter}\n"
-        status_msg += f"- Search limit: {self.search_limit}\n\n"
-        
-        status_msg += f"Stream Statistics:\n"
-        status_msg += f"- Status: {'Running' if stream_running else 'Stopped'}\n"
-        status_msg += f"- Comments checked: {self.stats['stream_comments_checked']}\n"
-        status_msg += f"- Matches found: {self.stats['stream_matches_found']}\n"
-        
-        if self.stats['last_stream_comment']:
-            time_since = (datetime.now() - self.stats['last_stream_comment']).seconds
-            status_msg += f"- Last comment: {time_since}s ago\n"
-        
-        if self.stats['stream_start_time']:
-            uptime = datetime.now() - self.stats['stream_start_time']
-            status_msg += f"- Uptime: {str(uptime).split('.')[0]}\n"
-        
-        status_msg += f"\nSearch Statistics:\n"
-        status_msg += f"- Posts checked: {self.stats['search_posts_checked']}\n"
-        status_msg += f"- Matches found: {self.stats['search_matches_found']}"
+        status_msg += f"Total groups: {len(self.groups)}\n"
+        status_msg += f"Active groups: {enabled_groups}\n"
+        status_msg += f"Total keywords: {total_keywords}\n"
+        status_msg += f"Total items processed: {total_processed}\n"
+        status_msg += f"Check interval: {self.check_interval} seconds\n"
+        status_msg += f"Search limit: {self.search_limit} per keyword\n"
+        status_msg += f"Time filter: {self.search_time_filter}\n"
+        status_msg += f"Reddit client: {'Active' if self.reddit else 'Not initialized'}\n"
+        status_msg += f"Queued notifications: {len(self.pending_notifications)}\n"
+        status_msg += f"Comment stream: {'Running' if self.stream_task and not self.stream_task.done() else 'Stopped'}\n"
+        status_msg += f"Notification processor: {'Running' if self.notification_task and not self.notification_task.done() else 'Stopped'}"
         
         await update.message.reply_text(status_msg)
     
     async def help_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Show help message"""
-        help_text = """
-Reddit to Telegram Monitor Bot
+        chat_id = update.effective_chat.id
+        
+        if self.is_owner(chat_id):
+            # Full help for owner
+            help_text = """
+Reddit to Telegram Monitor Bot - Multi-Group
 
-Commands:
-/add <keyword> - Add keyword to monitor
-/remove <keyword> - Remove keyword
-/list - List all monitored keywords
-/clear - Clear all keywords
-/status - Show bot status with statistics
+Owner Commands:
+
+Group Management:
+/addgroup <group_id> [name] - Add a new group to monitor
+/removegroup <group_id> - Remove a group
+/listgroups - List all monitored groups
+/togglegroup <group_id> - Enable/disable a group
+
+Keyword Management:
+/group - Select a group and add keywords
+   Then send: keyword1, keyword2, keyword3
+/removekeyword <group_id> keyword1, keyword2 - Remove keywords
+/listkeywords <group_id> - List keywords for a group
+/cleargroup <group_id> - Clear all keywords from a group
+
+Information:
+/status - Show bot status
 /help - Show this help message
 
-How it works:
-- Real-time stream monitors ALL new comments (primary)
-- Periodic search backfills recent posts (supplementary)
-- Stream catches everything going forward
-- Search helps catch posts and backfill gaps
+Features:
+• Searches ALL Reddit posts for keywords
+• Searches comments in recent posts
+• Real-time comment streaming
+• Phrase matching (exact words)
+• Multi-group support with separate keywords
+• Rate limiting and error recovery
 
-Note: Reddit's API search is limited compared to web search.
-The stream is your main monitoring tool.
+Example Workflow:
+1. /addgroup -1001234567890 Marketing Team
+2. /group (select the group)
+3. Send: pain killer, mutual fund, crypto news
+4. Bot will monitor and send alerts to that group
 
-Example:
-/add pain killer
-        """
+Note: Other groups can only receive alerts. All management is done from this control group.
+            """
+        else:
+            # Limited help for non-owner groups
+            help_text = """
+Reddit to Telegram Monitor Bot
+
+This bot monitors Reddit for specific keywords and sends alerts to this group.
+
+This group is in read-only mode.
+Commands can only be used by the bot owner in the control group.
+
+You will receive alerts when keywords match posts or comments on Reddit.
+
+For assistance, please contact the bot owner.
+            """
+        
         await update.message.reply_text(help_text.strip())
     
     async def monitoring_loop(self):
-        """Supplementary search loop (stream is primary)"""
-        # Wait a bit before starting searches to let stream establish
-        await asyncio.sleep(30)
-        
+        """Main monitoring loop"""
         while True:
             try:
                 await self.monitor_reddit()
@@ -586,40 +1056,64 @@ Example:
         # Create Telegram application
         app = Application.builder().token(self.telegram_token).build()
         
-        # Add handlers
-        app.add_handler(CommandHandler("add", self.add_keyword))
-        app.add_handler(CommandHandler("remove", self.remove_keyword))
-        app.add_handler(CommandHandler("list", self.list_keywords))
-        app.add_handler(CommandHandler("clear", self.clear_keywords))
+        # Add handlers (owner only commands)
+        app.add_handler(CommandHandler("addgroup", self.addgroup))
+        app.add_handler(CommandHandler("removegroup", self.removegroup))
+        app.add_handler(CommandHandler("group", self.group))
+        app.add_handler(CommandHandler("removekeyword", self.remove_keyword_cmd))
+        app.add_handler(CommandHandler("listgroups", self.listgroups))
+        app.add_handler(CommandHandler("listkeywords", self.listkeywords))
+        app.add_handler(CommandHandler("cleargroup", self.cleargroup))
+        app.add_handler(CommandHandler("togglegroup", self.togglegroup))
         app.add_handler(CommandHandler("status", self.status))
         app.add_handler(CommandHandler("help", self.help_command))
         app.add_handler(CommandHandler("start", self.help_command))
         
+        # Add callback query handler for group selection
+        app.add_handler(CallbackQueryHandler(self.group_selection_callback))
+        
+        # Add message handler for keyword input (must be last)
+        from telegram.ext import MessageHandler, filters
+        app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_message))
+        
         # Start Telegram bot
         await app.initialize()
         await app.start()
-
-        # Delete any existing webhook first
-        await app.bot.delete_webhook(drop_pending_updates=True)
-        logger.info("Deleted existing webhook")
-        
         await app.updater.start_polling()
         
         logger.info("Telegram bot started")
         
-        # Start comment stream (PRIMARY monitoring)
-        self.stream_task = asyncio.create_task(self.stream_comments())
-        logger.info("Comment stream started (primary monitoring)")
+        # Start notification processor in background
+        self.notification_task = asyncio.create_task(self.notification_processor())
+        logger.info("Notification processor started")
         
-        # Start search loop (SUPPLEMENTARY monitoring)
+        # Start comment stream in background
+        self.stream_task = asyncio.create_task(self.stream_comments())
+        logger.info("Comment stream started")
+        
+        # Start monitoring loop
         await self.monitoring_loop()
 
     async def cleanup(self):
         """Clean up resources"""
         logger.info("Cleaning up resources...")
         
-        self.stop_stream = True
+        # Save data before shutdown
+        self.save_data()
         
+        # Stop background tasks
+        self.stop_stream = True
+        self.stop_notification_processor = True
+        
+        # Wait for notification processor to finish
+        if self.notification_task:
+            self.notification_task.cancel()
+            try:
+                await self.notification_task
+            except asyncio.CancelledError:
+                pass
+        
+        # Wait for stream task to finish
         if self.stream_task:
             self.stream_task.cancel()
             try:
@@ -627,23 +1121,28 @@ Example:
             except asyncio.CancelledError:
                 pass
         
+        # Close Reddit client
         try:
             if self.reddit:
                 await self.reddit.close()
         except Exception as e:
             logger.error(f"Error closing Reddit client: {e}")
         
+        # Close Reddit session
         try:
             if self.reddit_session and not self.reddit_session.closed:
                 await self.reddit_session.close()
         except Exception as e:
             logger.error(f"Error closing Reddit session: {e}")
-    
+        
+        # Close Telegram session
         try:
             if self.telegram_session and not self.telegram_session.closed:
                 await self.telegram_session.close()
         except Exception as e:
             logger.error(f"Error closing Telegram session: {e}")
+        
+        logger.info("Cleanup completed")
 
 def main():
     """Main function"""
