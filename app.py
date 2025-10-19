@@ -413,54 +413,75 @@ class RedditTelegramBot:
             logger.error(f"Error searching posts for '{keyword}' (Group {group_id}): {e}")
 
     async def search_comments_via_posts(self, group_id: int, keyword: str):
-        """Search for comments by finding recent posts and checking their comments"""
-        try:
-            logger.info(f"Searching comments (via posts) for keyword: {keyword} (Group: {group_id})")
-            
-            if group_id not in self.processed_items:
-                self.processed_items[group_id] = set()
-            
-            await self.rate_limit_reddit_request()
-            
-            subreddit = await self.reddit.subreddit('all')
-            new_matches = 0
-            
-            # Get recent posts to check their comments
-            async for post in subreddit.new(limit=self.search_limit):
-                try:
-                    if post.num_comments == 0:
-                        continue
-                    
-                    # Expand comments
-                    await post.comments.replace_more(limit=0)
-                    
-                    for comment in post.comments.list():
-                        try:
-                            if comment.id in self.processed_items[group_id]:
-                                continue
-                            
-                            if hasattr(comment, 'body') and self.contains_phrase(comment.body, keyword):
-                                new_matches += 1
-                                message = self.format_notification(comment, keyword, "comment")
-                                await self.send_notification_to_group(group_id, message)
-                                self.processed_items[group_id].add(comment.id)
-                                logger.info(f"Found matching comment: {comment.id} for group {group_id}")
-                            
-                        except Exception as e:
-                            logger.error(f"Error processing comment: {e}")
-                            continue
-                    
-                    await asyncio.sleep(0.5)
-                    
-                except Exception as e:
-                    logger.error(f"Error processing post comments: {e}")
+    """Search for comments by finding recent posts and checking their comments"""
+    try:
+        logger.info(f"Searching comments (via posts) for keyword: {keyword} (Group: {group_id})")
+        
+        if group_id not in self.processed_items:
+            self.processed_items[group_id] = set()
+        
+        await self.rate_limit_reddit_request()
+        
+        subreddit = await self.reddit.subreddit('all')
+        new_matches = 0
+        
+        # Get recent posts to check their comments
+        async for post in subreddit.new(limit=self.search_limit):
+            try:
+                if post.num_comments == 0:
                     continue
-            
-            logger.info(f"Comment search (via posts) for '{keyword}' (Group {group_id}): {new_matches} new matches")
-            
-        except Exception as e:
-            logger.error(f"Error searching comments via posts for '{keyword}' (Group {group_id}): {e}")
-
+                
+                # Check if comments exist and are accessible
+                if not hasattr(post, 'comments') or post.comments is None:
+                    logger.debug(f"Post {post.id} has no accessible comments")
+                    continue
+                
+                # Expand comments
+                try:
+                    await post.comments.replace_more(limit=0)
+                except Exception as e:
+                    logger.debug(f"Could not expand comments for post {post.id}: {e}")
+                    continue
+                
+                # Get the comments list safely
+                try:
+                    comments_list = post.comments.list()
+                except Exception as e:
+                    logger.debug(f"Could not get comments list for post {post.id}: {e}")
+                    continue
+                
+                # Check if comments_list is valid and iterable
+                if comments_list is None:
+                    logger.debug(f"Comments list is None for post {post.id}")
+                    continue
+                
+                for comment in comments_list:
+                    try:
+                        if comment.id in self.processed_items[group_id]:
+                            continue
+                        
+                        if hasattr(comment, 'body') and self.contains_phrase(comment.body, keyword):
+                            new_matches += 1
+                            message = self.format_notification(comment, keyword, "comment")
+                            await self.send_notification_to_group(group_id, message)
+                            self.processed_items[group_id].add(comment.id)
+                            logger.info(f"Found matching comment: {comment.id} for group {group_id}")
+                        
+                    except Exception as e:
+                        logger.error(f"Error processing comment: {e}")
+                        continue
+                
+                await asyncio.sleep(0.5)
+                
+            except Exception as e:
+                logger.error(f"Error processing post comments: {e}")
+                continue
+        
+        logger.info(f"Comment search (via posts) for '{keyword}' (Group {group_id}): {new_matches} new matches")
+        
+    except Exception as e:
+        logger.error(f"Error searching comments via posts for '{keyword}' (Group {group_id}): {e}")
+        
     async def stream_comments(self):
         """Stream new comments from Reddit in real-time for all groups"""
         logger.info("Starting comment stream...")
