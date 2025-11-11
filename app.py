@@ -66,6 +66,9 @@ class RedditTelegramBot:
         # Temporary state for adding keywords and menu navigation
         self.pending_keyword_add: Dict[int, int] = {}  # user_id -> selected_group_id
         self.pending_keyword_remove: Dict[int, int] = {}  # user_id -> selected_group_id
+        # Temporary state for managing subreddits
+        self.pending_subreddit_add: Dict[int, int] = {}  # user_id -> selected_group_id
+        self.pending_subreddit_remove: Dict[int, int] = {}  # user_id -> selected_group_id
         self.menu_state: Dict[int, str] = {}  # user_id -> current_menu_state
         
         self.data_file = 'bot_data.json'
@@ -110,6 +113,8 @@ class RedditTelegramBot:
                         self.groups[group_id] = {
                             'name': group_info.get('name', f'Group {group_id}'),
                             'keywords': set(group_info.get('keywords', [])),
+                            # Empty or missing subreddits means ALL subreddits
+                            'subreddits': set(group_info.get('subreddits', [])),
                             'enabled': group_info.get('enabled', True),
                             'platform': platform,
                             'channel_id': group_info.get('channel_id', str(group_id)),
@@ -132,6 +137,7 @@ class RedditTelegramBot:
                         self.groups[self.owner_chat_id] = {
                             'name': 'Control Group (Owner)',
                             'keywords': set(),
+                            'subreddits': set(),
                             'enabled': True,
                             'platform': 'telegram',
                             'channel_id': str(self.owner_chat_id)
@@ -145,6 +151,7 @@ class RedditTelegramBot:
                     self.owner_chat_id: {
                         'name': 'Control Group (Owner)',
                         'keywords': set(),
+                        'subreddits': set(),
                         'enabled': True,
                         'platform': 'telegram',
                         'channel_id': str(self.owner_chat_id)
@@ -230,6 +237,7 @@ class RedditTelegramBot:
                 groups_data[str(group_id)] = {
                     'name': group_info['name'],
                     'keywords': list(group_info['keywords']),
+                    'subreddits': list(group_info.get('subreddits', set())),
                     'enabled': group_info['enabled'],
                     'platform': group_info.get('platform', 'telegram'),
                     'channel_id': group_info.get('channel_id', str(group_id)),
@@ -455,42 +463,58 @@ class RedditTelegramBot:
                 self.processed_items[group_id] = set()
             
             await self.rate_limit_reddit_request()
-            
-            subreddit = await self.reddit.subreddit('all')
-            new_matches = 0
-            
-            async for post in subreddit.search(
-                keyword, 
-                sort='new', 
-                time_filter=self.search_time_filter, 
-                limit=self.search_limit
-            ):
-                try:
-                    if post.id in self.processed_items[group_id]:
-                        continue
-                    
-                    # Validate exact phrase match
-                    title_match = self.contains_phrase(post.title, keyword)
-                    body_match = False
-                    
-                    try:
-                        if hasattr(post, 'selftext') and post.selftext:
-                            body_match = self.contains_phrase(post.selftext, keyword)
-                    except AttributeError:
-                        pass
 
-                    if title_match or body_match:
-                        new_matches += 1
-                        message = self.format_notification(post, keyword, "post")
-                        await self.send_notification_to_group(group_id, message)
-                        self.processed_items[group_id].add(post.id)
-                        logger.info(f"Found matching post: {post.id} for group {group_id}")
-                    
-                    await asyncio.sleep(0.1)
-                    
-                except Exception as e:
-                    logger.error(f"Error processing post: {e}")
-                    continue
+            # Determine which subreddits to search: specific list or 'all'
+            group_info = self.groups.get(group_id, {})
+            subreddits: Set[str] = set(group_info.get('subreddits', set()))
+            targets = list(subreddits) if subreddits else ['all']
+
+            new_matches = 0
+
+            for sr in targets:
+                subreddit = await self.reddit.subreddit(sr)
+
+                async for post in subreddit.search(
+                    keyword,
+                    sort='new',
+                    time_filter=self.search_time_filter,
+                    limit=self.search_limit
+                ):
+                    try:
+                        if post.id in self.processed_items[group_id]:
+                            continue
+
+                        # Validate exact phrase match
+                        title_match = self.contains_phrase(post.title, keyword)
+                        body_match = False
+
+                        try:
+                            if hasattr(post, 'selftext') and post.selftext:
+                                body_match = self.contains_phrase(post.selftext, keyword)
+                        except AttributeError:
+                            pass
+
+                        # If subreddits are specified, ensure post's subreddit matches
+                        if subreddits:
+                            try:
+                                post_sr = str(post.subreddit).lower()
+                            except Exception:
+                                post_sr = ""
+                            if post_sr not in subreddits:
+                                continue
+
+                        if title_match or body_match:
+                            new_matches += 1
+                            message = self.format_notification(post, keyword, "post")
+                            await self.send_notification_to_group(group_id, message)
+                            self.processed_items[group_id].add(post.id)
+                            logger.info(f"Found matching post: {post.id} for group {group_id}")
+
+                        await asyncio.sleep(0.1)
+
+                    except Exception as e:
+                        logger.error(f"Error processing post: {e}")
+                        continue
             
             logger.info(f"Post search for '{keyword}' (Group {group_id}): {new_matches} new matches")
             
@@ -506,12 +530,18 @@ class RedditTelegramBot:
                 self.processed_items[group_id] = set()
             
             await self.rate_limit_reddit_request()
-            
-            subreddit = await self.reddit.subreddit('all')
+
+            group_info = self.groups.get(group_id, {})
+            subreddits: Set[str] = set(group_info.get('subreddits', set()))
+            targets = list(subreddits) if subreddits else ['all']
+
             new_matches = 0
-            
-            # Get recent posts to check their comments
-            async for post in subreddit.new(limit=self.search_limit):
+
+            # Iterate target subreddits
+            for sr in targets:
+                subreddit = await self.reddit.subreddit(sr)
+                # Get recent posts to check their comments
+                async for post in subreddit.new(limit=self.search_limit):
                 try:
                     if post.num_comments == 0:
                         continue
@@ -546,6 +576,14 @@ class RedditTelegramBot:
                                 continue
                             
                             if hasattr(comment, 'body') and self.contains_phrase(comment.body, keyword):
+                                # If subreddits are specified, ensure comment's subreddit matches
+                                if subreddits:
+                                    try:
+                                        c_sr = str(comment.subreddit).lower()
+                                    except Exception:
+                                        c_sr = ""
+                                    if c_sr not in subreddits:
+                                        continue
                                 new_matches += 1
                                 message = self.format_notification(comment, keyword, "comment")
                                 await self.send_notification_to_group(group_id, message)
@@ -595,6 +633,16 @@ class RedditTelegramBot:
                             if comment.id in self.processed_items[group_id]:
                                 continue
                             
+                            # If group limits subreddits, filter first
+                            subreddits: Set[str] = set(group_info.get('subreddits', set()))
+                            if subreddits:
+                                try:
+                                    c_sr = str(comment.subreddit).lower()
+                                except Exception:
+                                    c_sr = ""
+                                if c_sr not in subreddits:
+                                    continue
+
                             # Check against all keywords for this group
                             for keyword in list(group_info['keywords']):
                                 if hasattr(comment, 'body') and self.contains_phrase(comment.body, keyword):
@@ -917,6 +965,7 @@ class RedditTelegramBot:
             self.groups[new_group_id] = {
                 'name': group_name,
                 'keywords': set(),
+                'subreddits': set(),
                 'enabled': True,
                 'platform': platform,
                 'channel_id': channel_id,
@@ -1030,6 +1079,8 @@ class RedditTelegramBot:
                 
                 group_info = self.groups[group_id]
                 keyword_count = len(group_info['keywords'])
+                subs = group_info.get('subreddits', set())
+                subs_status = f"{len(subs)} subs" if subs else "All subreddits"
                 status = "Enabled" if group_info['enabled'] else "Disabled"
                 platform = group_info.get('platform', 'telegram')
                 channel_id = group_info.get('channel_id', str(group_id))
@@ -1040,6 +1091,10 @@ class RedditTelegramBot:
                     [InlineKeyboardButton("➖ Remove Keywords", callback_data=f"remove_kw:{group_id}")],
                     [InlineKeyboardButton("📋 List Keywords", callback_data=f"list_kw:{group_id}")],
                     [InlineKeyboardButton("🗑️ Clear All Keywords", callback_data=f"clear_kw:{group_id}")],
+                    [InlineKeyboardButton("➕ Add Subreddit", callback_data=f"add_sr:{group_id}")],
+                    [InlineKeyboardButton("➖ Remove Subreddit", callback_data=f"remove_sr:{group_id}")],
+                    [InlineKeyboardButton("📋 List Subreddits", callback_data=f"list_sr:{group_id}")],
+                    [InlineKeyboardButton("🗑️ Clear Subreddits (All)", callback_data=f"clear_sr:{group_id}")],
                     [InlineKeyboardButton(f"🔄 Toggle ({status})", callback_data=f"toggle:{group_id}")],
                     [InlineKeyboardButton("« Back to Groups", callback_data="back_to_groups")]
                 ]
@@ -1050,6 +1105,7 @@ class RedditTelegramBot:
                 message += f"Channel ID: {channel_id}\n"
                 message += f"Status: {status}\n"
                 message += f"Keywords: {keyword_count}\n"
+                message += f"Subreddits: {subs_status}\n"
                 message += f"Internal ID: {group_id}"
                 
                 await query.edit_message_text(message, reply_markup=reply_markup)
@@ -1109,6 +1165,91 @@ class RedditTelegramBot:
                 f"Send keywords to remove (comma-separated):",
                 reply_markup=reply_markup
             )
+
+        # Add subreddit flow
+        elif data.startswith("add_sr:"):
+            group_id = int(data.split(":")[1])
+            self.pending_subreddit_add[user_id] = group_id
+            self.menu_state[user_id] = "adding_subs"
+
+            group_name = self.groups[group_id]['name']
+            current_subs = self.groups[group_id].get('subreddits', set())
+            subs_text = "\n  ".join(sorted(current_subs)) if current_subs else "All (no filter)"
+
+            keyboard = [[InlineKeyboardButton("« Cancel", callback_data=f"manage_group:{group_id}")]]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+
+            await query.edit_message_text(
+                f"Adding subreddits to: {group_name}\n\n"
+                f"Current subreddits:\n  {subs_text}\n\n"
+                f"Send subreddit names separated by commas:\n"
+                f"Example: wallstreetbets, stocks, cryptoCurrency\n\n"
+                f"Tip: You can include or omit the r/ prefix.",
+                reply_markup=reply_markup
+            )
+
+        # Remove subreddit flow
+        elif data.startswith("remove_sr:"):
+            group_id = int(data.split(":")[1])
+            subs = self.groups[group_id].get('subreddits', set())
+            if not subs:
+                keyboard = [[InlineKeyboardButton("« Back", callback_data=f"manage_group:{group_id}")]]
+                reply_markup = InlineKeyboardMarkup(keyboard)
+                await query.edit_message_text(
+                    f"No subreddit filter configured for {self.groups[group_id]['name']} (currently All).",
+                    reply_markup=reply_markup
+                )
+                return
+
+            self.pending_subreddit_remove[user_id] = group_id
+            self.menu_state[user_id] = "removing_subs"
+
+            group_name = self.groups[group_id]['name']
+            subs_text = "\n  ".join(sorted(subs))
+
+            keyboard = [[InlineKeyboardButton("« Cancel", callback_data=f"manage_group:{group_id}")]]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+
+            await query.edit_message_text(
+                f"Removing subreddits from: {group_name}\n\n"
+                f"Current subreddits:\n  {subs_text}\n\n"
+                f"Send subreddits to remove (comma-separated):",
+                reply_markup=reply_markup
+            )
+
+        # List subreddits
+        elif data.startswith("list_sr:"):
+            group_id = int(data.split(":")[1])
+            subs = sorted(self.groups[group_id].get('subreddits', set()))
+
+            if not subs:
+                subs_text = "All (no filter)"
+            else:
+                subs_text = "\n  ".join(subs)
+
+            keyboard = [[InlineKeyboardButton("« Back", callback_data=f"manage_group:{group_id}")]]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+
+            message = f"{self.groups[group_id]['name']}\n\n"
+            message += f"Subreddits ({'All' if not subs else len(subs)}):\n  {subs_text}"
+
+            await query.edit_message_text(message, reply_markup=reply_markup)
+
+        # Clear subreddit filter (revert to All)
+        elif data.startswith("clear_sr:"):
+            group_id = int(data.split(":")[1])
+            count = len(self.groups[group_id].get('subreddits', set()))
+            self.groups[group_id]['subreddits'] = set()
+            self.save_data()
+
+            keyboard = [[InlineKeyboardButton("« Back", callback_data=f"manage_group:{group_id}")]]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+
+            await query.edit_message_text(
+                f"Cleared subreddit filter ({count} removed). Now monitoring All subreddits.",
+                reply_markup=reply_markup
+            )
+            logger.info(f"Cleared subreddit filter from group {group_id}")
         
         # List keywords
         elif data.startswith("list_kw:"):
@@ -1290,6 +1431,113 @@ class RedditTelegramBot:
             
             await update.message.reply_text(response, reply_markup=reply_markup)
             logger.info(f"Removed {len(removed)} keywords from group {group_id}")
+
+        # Adding subreddits
+        elif user_id in self.pending_subreddit_add and menu_state == "adding_subs":
+            group_id = self.pending_subreddit_add[user_id]
+
+            text = update.message.text
+            # Normalize subreddit names: strip r/ and whitespace, lowercase
+            subs = []
+            for token in text.split(','):
+                name = token.strip().lower()
+                if not name:
+                    continue
+                if name.startswith('r/'):
+                    name = name[2:]
+                # basic validation: alphanum + underscores is typical
+                name = re.sub(r'[^a-z0-9_]+', '', name)
+                if name:
+                    subs.append(name)
+
+            if not subs:
+                await update.message.reply_text("No valid subreddit names found. Please try again.")
+                return
+
+            if 'subreddits' not in self.groups[group_id]:
+                self.groups[group_id]['subreddits'] = set()
+
+            added = []
+            skipped = []
+            for s in subs:
+                if s in self.groups[group_id]['subreddits']:
+                    skipped.append(s)
+                else:
+                    self.groups[group_id]['subreddits'].add(s)
+                    added.append(s)
+
+            # Clear pending state
+            del self.pending_subreddit_add[user_id]
+            del self.menu_state[user_id]
+
+            self.save_data()
+
+            response = f"Subreddits added to '{self.groups[group_id]['name']}':\n\n"
+            if added:
+                response += "Added:\n  " + "\n  ".join(added)
+            if skipped:
+                response += "\n\nSkipped (already exists):\n  " + "\n  ".join(skipped)
+
+            keyboard = [[InlineKeyboardButton("« Back to Group", callback_data=f"manage_group:{group_id}")]]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+
+            await update.message.reply_text(response, reply_markup=reply_markup)
+            logger.info(f"Added {len(added)} subreddits to group {group_id}")
+
+        # Removing subreddits
+        elif user_id in self.pending_subreddit_remove and menu_state == "removing_subs":
+            group_id = self.pending_subreddit_remove[user_id]
+
+            text = update.message.text
+            subs = []
+            for token in text.split(','):
+                name = token.strip().lower()
+                if not name:
+                    continue
+                if name.startswith('r/'):
+                    name = name[2:]
+                name = re.sub(r'[^a-z0-9_]+', '', name)
+                if name:
+                    subs.append(name)
+
+            if not subs:
+                await update.message.reply_text("No valid subreddit names found. Please try again.")
+                return
+
+            if 'subreddits' not in self.groups[group_id] or not self.groups[group_id]['subreddits']:
+                await update.message.reply_text("No subreddit filter configured for this group.")
+                return
+
+            removed = []
+            not_found = []
+            for s in subs:
+                if s in self.groups[group_id]['subreddits']:
+                    self.groups[group_id]['subreddits'].remove(s)
+                    removed.append(s)
+                else:
+                    not_found.append(s)
+
+            # If set becomes empty, it means 'All'
+            if not self.groups[group_id]['subreddits']:
+                self.groups[group_id]['subreddits'] = set()
+
+            # Clear pending state
+            del self.pending_subreddit_remove[user_id]
+            del self.menu_state[user_id]
+
+            self.save_data()
+
+            response = f"Subreddits updated for '{self.groups[group_id]['name']}':\n\n"
+            if removed:
+                response += "Removed:\n  " + "\n  ".join(removed)
+            if not_found:
+                response += "\n\nNot found:\n  " + "\n  ".join(not_found)
+
+            keyboard = [[InlineKeyboardButton("« Back to Group", callback_data=f"manage_group:{group_id}")]]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+
+            await update.message.reply_text(response, reply_markup=reply_markup)
+            logger.info(f"Removed {len(removed)} subreddits from group {group_id}")
     
     async def addkeyword(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Add keywords to a group via direct command (Owner only)"""
@@ -1420,13 +1668,16 @@ class RedditTelegramBot:
         for group_id, group_info in self.groups.items():
             status = "[Active]" if group_info['enabled'] else "[Disabled]"
             keyword_count = len(group_info['keywords'])
+            subs = group_info.get('subreddits', set())
+            subs_text = "All" if not subs else f"{len(subs)}"
             platform = group_info.get('platform', 'telegram')
             channel_id = group_info.get('channel_id', str(group_id))
             message += f"{status} {group_info['name']}\n"
             message += f"   Platform: {platform.title()}\n"
             message += f"   Channel ID: {channel_id}\n"
             message += f"   Internal ID: {group_id}\n"
-            message += f"   Keywords: {keyword_count}\n\n"
+            message += f"   Keywords: {keyword_count}\n"
+            message += f"   Subreddits: {subs_text}\n\n"
         
         await update.message.reply_text(message)
     
@@ -1594,6 +1845,7 @@ Interactive Menu (Recommended):
 /group - Opens interactive menu to manage groups
    • Select group
    • Add/Remove keywords via buttons
+                   • Add/Remove subreddits (default All if none set)
    • List, clear, or toggle group
    • No need to remember group IDs
 
