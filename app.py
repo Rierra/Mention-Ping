@@ -543,58 +543,58 @@ class RedditTelegramBot:
                 # Get recent posts to check their comments
                 async for post in subreddit.new(limit=self.search_limit):
                     try:
-                    if post.num_comments == 0:
-                        continue
-                    
-                    # Check if comments exist and are accessible
-                    if not hasattr(post, 'comments') or post.comments is None:
-                        logger.debug(f"Post {post.id} has no accessible comments")
-                        continue
-                    
-                    # Expand comments
-                    try:
-                        await post.comments.replace_more(limit=0)
-                    except Exception as e:
-                        logger.debug(f"Could not expand comments for post {post.id}: {e}")
-                        continue
-                    
-                    # Get the comments list safely
-                    try:
-                        comments_list = post.comments.list()
-                    except Exception as e:
-                        logger.debug(f"Could not get comments list for post {post.id}: {e}")
-                        continue
-                    
-                    # Check if comments_list is valid and iterable
-                    if comments_list is None:
-                        logger.debug(f"Comments list is None for post {post.id}")
-                        continue
-                    
-                    for comment in comments_list:
-                        try:
-                            if comment.id in self.processed_items[group_id]:
-                                continue
-                            
-                            if hasattr(comment, 'body') and self.contains_phrase(comment.body, keyword):
-                                # If subreddits are specified, ensure comment's subreddit matches
-                                if subreddits:
-                                    try:
-                                        c_sr = str(comment.subreddit).lower()
-                                    except Exception:
-                                        c_sr = ""
-                                    if c_sr not in subreddits:
-                                        continue
-                                new_matches += 1
-                                message = self.format_notification(comment, keyword, "comment")
-                                await self.send_notification_to_group(group_id, message)
-                                self.processed_items[group_id].add(comment.id)
-                                logger.info(f"Found matching comment: {comment.id} for group {group_id}")
-                            
-                        except Exception as e:
-                            logger.error(f"Error processing comment: {e}")
+                        if post.num_comments == 0:
                             continue
-                    
-                    await asyncio.sleep(0.5)
+                        
+                        # Check if comments exist and are accessible
+                        if not hasattr(post, 'comments') or post.comments is None:
+                            logger.debug(f"Post {post.id} has no accessible comments")
+                            continue
+                        
+                        # Expand comments
+                        try:
+                            await post.comments.replace_more(limit=0)
+                        except Exception as e:
+                            logger.debug(f"Could not expand comments for post {post.id}: {e}")
+                            continue
+                        
+                        # Get the comments list safely
+                        try:
+                            comments_list = post.comments.list()
+                        except Exception as e:
+                            logger.debug(f"Could not get comments list for post {post.id}: {e}")
+                            continue
+                        
+                        # Check if comments_list is valid and iterable
+                        if comments_list is None:
+                            logger.debug(f"Comments list is None for post {post.id}")
+                            continue
+                        
+                        for comment in comments_list:
+                            try:
+                                if comment.id in self.processed_items[group_id]:
+                                    continue
+                                
+                                if hasattr(comment, 'body') and self.contains_phrase(comment.body, keyword):
+                                    # If subreddits are specified, ensure comment's subreddit matches
+                                    if subreddits:
+                                        try:
+                                            c_sr = str(comment.subreddit).lower()
+                                        except Exception:
+                                            c_sr = ""
+                                        if c_sr not in subreddits:
+                                            continue
+                                    new_matches += 1
+                                    message = self.format_notification(comment, keyword, "comment")
+                                    await self.send_notification_to_group(group_id, message)
+                                    self.processed_items[group_id].add(comment.id)
+                                    logger.info(f"Found matching comment: {comment.id} for group {group_id}")
+                                
+                            except Exception as e:
+                                logger.error(f"Error processing comment: {e}")
+                                continue
+                        
+                        await asyncio.sleep(0.5)
                     
                 except Exception as e:
                     logger.error(f"Error processing post comments: {e}")
