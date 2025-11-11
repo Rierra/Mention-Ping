@@ -542,7 +542,7 @@ class RedditTelegramBot:
                 subreddit = await self.reddit.subreddit(sr)
                 # Get recent posts to check their comments
                 async for post in subreddit.new(limit=self.search_limit):
-                try:
+                    try:
                     if post.num_comments == 0:
                         continue
                     
