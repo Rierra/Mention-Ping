@@ -69,6 +69,9 @@ class RedditTelegramBot:
         # Temporary state for managing subreddits
         self.pending_subreddit_add: Dict[int, int] = {}  # user_id -> selected_group_id
         self.pending_subreddit_remove: Dict[int, int] = {}  # user_id -> selected_group_id
+        # Temporary state for managing subreddit blacklist
+        self.pending_subreddit_blacklist_add: Dict[int, int] = {}
+        self.pending_subreddit_blacklist_remove: Dict[int, int] = {}
         self.menu_state: Dict[int, str] = {}  # user_id -> current_menu_state
         
         self.data_file = 'bot_data.json'
@@ -115,6 +118,9 @@ class RedditTelegramBot:
                             'keywords': set(group_info.get('keywords', [])),
                             # Empty or missing subreddits means ALL subreddits
                             'subreddits': set(group_info.get('subreddits', [])),
+                            'subreddit_blacklist': set(
+                                s.lower() for s in group_info.get('subreddit_blacklist', [])
+                            ),
                             'enabled': group_info.get('enabled', True),
                             'platform': platform,
                             'channel_id': group_info.get('channel_id', str(group_id)),
@@ -138,6 +144,7 @@ class RedditTelegramBot:
                             'name': 'Control Group (Owner)',
                             'keywords': set(),
                             'subreddits': set(),
+                            'subreddit_blacklist': set(),
                             'enabled': True,
                             'platform': 'telegram',
                             'channel_id': str(self.owner_chat_id)
@@ -152,6 +159,7 @@ class RedditTelegramBot:
                         'name': 'Control Group (Owner)',
                         'keywords': set(),
                         'subreddits': set(),
+                        'subreddit_blacklist': set(),
                         'enabled': True,
                         'platform': 'telegram',
                         'channel_id': str(self.owner_chat_id)
@@ -166,6 +174,8 @@ class RedditTelegramBot:
                 self.owner_chat_id: {
                     'name': 'Control Group (Owner)',
                     'keywords': set(),
+                    'subreddits': set(),
+                    'subreddit_blacklist': set(),
                     'enabled': True,
                     'platform': 'telegram',
                     'channel_id': str(self.owner_chat_id)
@@ -238,6 +248,7 @@ class RedditTelegramBot:
                     'name': group_info['name'],
                     'keywords': list(group_info['keywords']),
                     'subreddits': list(group_info.get('subreddits', set())),
+                    'subreddit_blacklist': list(group_info.get('subreddit_blacklist', set())),
                     'enabled': group_info['enabled'],
                     'platform': group_info.get('platform', 'telegram'),
                     'channel_id': group_info.get('channel_id', str(group_id)),
@@ -467,11 +478,15 @@ class RedditTelegramBot:
             # Determine which subreddits to search: specific list or 'all'
             group_info = self.groups.get(group_id, {})
             subreddits: Set[str] = set(group_info.get('subreddits', set()))
+            blacklist: Set[str] = set(group_info.get('subreddit_blacklist', set()))
             targets = list(subreddits) if subreddits else ['all']
 
             new_matches = 0
 
             for sr in targets:
+                if sr in blacklist:
+                    logger.debug(f"Skipping subreddit {sr} for group {group_id} (blacklisted)")
+                    continue
                 subreddit = await self.reddit.subreddit(sr)
 
                 async for post in subreddit.search(
@@ -501,6 +516,21 @@ class RedditTelegramBot:
                             except Exception:
                                 post_sr = ""
                             if post_sr not in subreddits:
+                                continue
+                        else:
+                            try:
+                                post_sr = str(post.subreddit).lower()
+                            except Exception:
+                                post_sr = ""
+
+                        # Skip if subreddit is blacklisted
+                        if blacklist:
+                            if not post_sr:
+                                try:
+                                    post_sr = str(post.subreddit).lower()
+                                except Exception:
+                                    post_sr = ""
+                            if post_sr in blacklist:
                                 continue
 
                         if title_match or body_match:
@@ -533,12 +563,16 @@ class RedditTelegramBot:
 
             group_info = self.groups.get(group_id, {})
             subreddits: Set[str] = set(group_info.get('subreddits', set()))
+            blacklist: Set[str] = set(group_info.get('subreddit_blacklist', set()))
             targets = list(subreddits) if subreddits else ['all']
 
             new_matches = 0
 
             # Iterate target subreddits
             for sr in targets:
+                if sr in blacklist:
+                    logger.debug(f"Skipping subreddit {sr} for group {group_id} (blacklisted)")
+                    continue
                 subreddit = await self.reddit.subreddit(sr)
                 # Get recent posts to check their comments
                 async for post in subreddit.new(limit=self.search_limit):
@@ -570,14 +604,17 @@ class RedditTelegramBot:
                                 if comment.id in self.processed_items[group_id]:
                                     continue
                                 if hasattr(comment, 'body') and self.contains_phrase(comment.body, keyword):
-                                    # If subreddits are specified, ensure comment's subreddit matches
-                                    if subreddits:
-                                        try:
-                                            c_sr = str(comment.subreddit).lower()
-                                        except Exception:
-                                            c_sr = ""
-                                        if c_sr not in subreddits:
-                                            continue
+                                    # Determine comment subreddit
+                                    try:
+                                        c_sr = str(comment.subreddit).lower()
+                                    except Exception:
+                                        c_sr = ""
+                                    # If subreddits whitelist specified, ensure match
+                                    if subreddits and c_sr not in subreddits:
+                                        continue
+                                    # Apply blacklist (always)
+                                    if blacklist and c_sr in blacklist:
+                                        continue
                                     new_matches += 1
                                     message = self.format_notification(comment, keyword, "comment")
                                     await self.send_notification_to_group(group_id, message)
@@ -626,13 +663,15 @@ class RedditTelegramBot:
                             
                             # If group limits subreddits, filter first
                             subreddits: Set[str] = set(group_info.get('subreddits', set()))
-                            if subreddits:
-                                try:
-                                    c_sr = str(comment.subreddit).lower()
-                                except Exception:
-                                    c_sr = ""
-                                if c_sr not in subreddits:
-                                    continue
+                            blacklist: Set[str] = set(group_info.get('subreddit_blacklist', set()))
+                            try:
+                                c_sr = str(comment.subreddit).lower()
+                            except Exception:
+                                c_sr = ""
+                            if subreddits and c_sr not in subreddits:
+                                continue
+                            if blacklist and c_sr in blacklist:
+                                continue
 
                             # Check against all keywords for this group
                             for keyword in list(group_info['keywords']):
@@ -957,6 +996,7 @@ class RedditTelegramBot:
                 'name': group_name,
                 'keywords': set(),
                 'subreddits': set(),
+                'subreddit_blacklist': set(),
                 'enabled': True,
                 'platform': platform,
                 'channel_id': channel_id,
@@ -1072,6 +1112,8 @@ class RedditTelegramBot:
                 keyword_count = len(group_info['keywords'])
                 subs = group_info.get('subreddits', set())
                 subs_status = f"{len(subs)} subs" if subs else "All subreddits"
+                blacklist = group_info.get('subreddit_blacklist', set())
+                blacklist_status = f"{len(blacklist)} blocked" if blacklist else "None"
                 status = "Enabled" if group_info['enabled'] else "Disabled"
                 platform = group_info.get('platform', 'telegram')
                 channel_id = group_info.get('channel_id', str(group_id))
@@ -1086,6 +1128,7 @@ class RedditTelegramBot:
                     [InlineKeyboardButton("➖ Remove Subreddit", callback_data=f"remove_sr:{group_id}")],
                     [InlineKeyboardButton("📋 List Subreddits", callback_data=f"list_sr:{group_id}")],
                     [InlineKeyboardButton("🗑️ Clear Subreddits (All)", callback_data=f"clear_sr:{group_id}")],
+                    [InlineKeyboardButton("🚫 Blacklist Subreddits", callback_data=f"blacklist_menu:{group_id}")],
                     [InlineKeyboardButton(f"🔄 Toggle ({status})", callback_data=f"toggle:{group_id}")],
                     [InlineKeyboardButton("« Back to Groups", callback_data="back_to_groups")]
                 ]
@@ -1097,6 +1140,7 @@ class RedditTelegramBot:
                 message += f"Status: {status}\n"
                 message += f"Keywords: {keyword_count}\n"
                 message += f"Subreddits: {subs_status}\n"
+                message += f"Blacklist: {blacklist_status}\n"
                 message += f"Internal ID: {group_id}"
                 
                 await query.edit_message_text(message, reply_markup=reply_markup)
@@ -1241,6 +1285,114 @@ class RedditTelegramBot:
                 reply_markup=reply_markup
             )
             logger.info(f"Cleared subreddit filter from group {group_id}")
+
+        # Blacklist management menu
+        elif data.startswith("blacklist_menu:"):
+            group_id = int(data.split(":")[1])
+            blacklist = sorted(self.groups[group_id].get('subreddit_blacklist', set()))
+            count = len(blacklist)
+
+            keyboard = [
+                [InlineKeyboardButton("➕ Add to Blacklist", callback_data=f"add_bl:{group_id}")],
+                [InlineKeyboardButton("➖ Remove from Blacklist", callback_data=f"remove_bl:{group_id}")],
+                [InlineKeyboardButton("📋 List Blacklisted", callback_data=f"list_bl:{group_id}")],
+                [InlineKeyboardButton("🗑️ Clear Blacklist", callback_data=f"clear_bl:{group_id}")],
+                [InlineKeyboardButton("« Back", callback_data=f"manage_group:{group_id}")]
+            ]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+
+            message = f"Blacklist for {self.groups[group_id]['name']}:\n\n"
+            if count == 0:
+                message += "No subreddits are currently blacklisted.\n\n"
+            else:
+                formatted = '\n  '.join(blacklist)
+                message += f"Blacklisted ({count}):\n  {formatted}\n\n"
+            message += "Choose an action below."
+
+            await query.edit_message_text(message, reply_markup=reply_markup)
+
+        # Add to blacklist flow
+        elif data.startswith("add_bl:"):
+            group_id = int(data.split(":")[1])
+            self.pending_subreddit_blacklist_add[user_id] = group_id
+            self.menu_state[user_id] = "adding_blacklist"
+
+            current = self.groups[group_id].get('subreddit_blacklist', set())
+            current_text = "\n  ".join(sorted(current)) if current else "None"
+
+            keyboard = [[InlineKeyboardButton("« Cancel", callback_data=f"blacklist_menu:{group_id}")]]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+
+            await query.edit_message_text(
+                f"Blacklist Subreddits for: {self.groups[group_id]['name']}\n\n"
+                f"Currently blacklisted:\n  {current_text}\n\n"
+                f"Send subreddit names to blacklist (comma-separated).\n"
+                f"Example: wallstreetbets, stocks\n\n"
+                f"Tip: r/ prefix optional.",
+                reply_markup=reply_markup
+            )
+
+        # Remove from blacklist flow
+        elif data.startswith("remove_bl:"):
+            group_id = int(data.split(":")[1])
+            current = self.groups[group_id].get('subreddit_blacklist', set())
+
+            if not current:
+                keyboard = [[InlineKeyboardButton("« Back", callback_data=f"blacklist_menu:{group_id}")]]
+                reply_markup = InlineKeyboardMarkup(keyboard)
+                await query.edit_message_text(
+                    "No subreddits are blacklisted for this group.",
+                    reply_markup=reply_markup
+                )
+                return
+
+            self.pending_subreddit_blacklist_remove[user_id] = group_id
+            self.menu_state[user_id] = "removing_blacklist"
+
+            current_text = "\n  ".join(sorted(current))
+            keyboard = [[InlineKeyboardButton("« Cancel", callback_data=f"blacklist_menu:{group_id}")]]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+
+            await query.edit_message_text(
+                f"Removing from blacklist: {self.groups[group_id]['name']}\n\n"
+                f"Current blacklist:\n  {current_text}\n\n"
+                f"Send subreddit names to remove (comma-separated).",
+                reply_markup=reply_markup
+            )
+
+        # List blacklisted subreddits
+        elif data.startswith("list_bl:"):
+            group_id = int(data.split(":")[1])
+            blacklist = sorted(self.groups[group_id].get('subreddit_blacklist', set()))
+
+            if not blacklist:
+                content = "No subreddits are blacklisted (monitoring all unless whitelisted)."
+            else:
+                content = "\n  ".join(blacklist)
+
+            keyboard = [[InlineKeyboardButton("« Back", callback_data=f"blacklist_menu:{group_id}")]]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+
+            message = f"{self.groups[group_id]['name']}\n\n"
+            message += f"Blacklisted Subreddits ({len(blacklist)}):\n  {content}"
+
+            await query.edit_message_text(message, reply_markup=reply_markup)
+
+        # Clear blacklist
+        elif data.startswith("clear_bl:"):
+            group_id = int(data.split(":")[1])
+            count = len(self.groups[group_id].get('subreddit_blacklist', set()))
+            self.groups[group_id]['subreddit_blacklist'] = set()
+            self.save_data()
+
+            keyboard = [[InlineKeyboardButton("« Back", callback_data=f"blacklist_menu:{group_id}")]]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+
+            await query.edit_message_text(
+                f"Cleared {count} subreddits from blacklist. All allowed unless whitelisted.",
+                reply_markup=reply_markup
+            )
+            logger.info(f"Cleared subreddit blacklist for group {group_id}")
         
         # List keywords
         elif data.startswith("list_kw:"):
@@ -1530,6 +1682,111 @@ class RedditTelegramBot:
             await update.message.reply_text(response, reply_markup=reply_markup)
             logger.info(f"Removed {len(removed)} subreddits from group {group_id}")
     
+        # Adding blacklist subreddits
+        elif user_id in self.pending_subreddit_blacklist_add and menu_state == "adding_blacklist":
+            group_id = self.pending_subreddit_blacklist_add[user_id]
+
+            text = update.message.text
+            subs = []
+            for token in text.split(','):
+                name = token.strip().lower()
+                if not name:
+                    continue
+                if name.startswith('r/'):
+                    name = name[2:]
+                name = re.sub(r'[^a-z0-9_]+', '', name)
+                if name:
+                    subs.append(name)
+
+            if not subs:
+                await update.message.reply_text("No valid subreddit names found. Please try again.")
+                return
+
+            if 'subreddit_blacklist' not in self.groups[group_id]:
+                self.groups[group_id]['subreddit_blacklist'] = set()
+
+            added = []
+            skipped = []
+            for s in subs:
+                if s in self.groups[group_id]['subreddit_blacklist']:
+                    skipped.append(s)
+                else:
+                    self.groups[group_id]['subreddit_blacklist'].add(s)
+                    added.append(s)
+                    # Also ensure whitelist doesn't include it if both were set
+                    if s in self.groups[group_id].get('subreddits', set()):
+                        self.groups[group_id]['subreddits'].discard(s)
+
+            # Clear pending state
+            del self.pending_subreddit_blacklist_add[user_id]
+            del self.menu_state[user_id]
+
+            self.save_data()
+
+            response = f"Subreddit blacklist updated for '{self.groups[group_id]['name']}':\n\n"
+            if added:
+                response += "Blacklisted:\n  " + "\n  ".join(added)
+            if skipped:
+                response += "\n\nSkipped (already blacklisted):\n  " + "\n  ".join(skipped)
+
+            keyboard = [[InlineKeyboardButton("« Back", callback_data=f"blacklist_menu:{group_id}")]]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+
+            await update.message.reply_text(response, reply_markup=reply_markup)
+            logger.info(f"Added {len(added)} subreddits to blacklist for group {group_id}")
+
+        # Removing blacklist subreddits
+        elif user_id in self.pending_subreddit_blacklist_remove and menu_state == "removing_blacklist":
+            group_id = self.pending_subreddit_blacklist_remove[user_id]
+
+            text = update.message.text
+            subs = []
+            for token in text.split(','):
+                name = token.strip().lower()
+                if not name:
+                    continue
+                if name.startswith('r/'):
+                    name = name[2:]
+                name = re.sub(r'[^a-z0-9_]+', '', name)
+                if name:
+                    subs.append(name)
+
+            if not subs:
+                await update.message.reply_text("No valid subreddit names found. Please try again.")
+                return
+
+            blacklist = self.groups[group_id].get('subreddit_blacklist', set())
+            if not blacklist:
+                await update.message.reply_text("No subreddits are blacklisted for this group.")
+                return
+
+            removed = []
+            not_found = []
+            for s in subs:
+                if s in blacklist:
+                    blacklist.remove(s)
+                    removed.append(s)
+                else:
+                    not_found.append(s)
+
+            # Clear pending state
+            del self.pending_subreddit_blacklist_remove[user_id]
+            del self.menu_state[user_id]
+
+            self.save_data()
+
+            response = f"Subreddit blacklist updated for '{self.groups[group_id]['name']}':\n\n"
+            if removed:
+                response += "Removed:\n  " + "\n  ".join(removed)
+            if not_found:
+                response += "\n\nNot found:\n  " + "\n  ".join(not_found)
+
+            keyboard = [[InlineKeyboardButton("« Back", callback_data=f"blacklist_menu:{group_id}")]]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+
+            await update.message.reply_text(response, reply_markup=reply_markup)
+            logger.info(f"Removed {len(removed)} subreddits from blacklist for group {group_id}")
+
     async def addkeyword(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Add keywords to a group via direct command (Owner only)"""
         chat_id = update.effective_chat.id
@@ -1661,6 +1918,8 @@ class RedditTelegramBot:
             keyword_count = len(group_info['keywords'])
             subs = group_info.get('subreddits', set())
             subs_text = "All" if not subs else f"{len(subs)}"
+            blacklist = group_info.get('subreddit_blacklist', set())
+            blacklist_text = "0" if not blacklist else f"{len(blacklist)}"
             platform = group_info.get('platform', 'telegram')
             channel_id = group_info.get('channel_id', str(group_id))
             message += f"{status} {group_info['name']}\n"
@@ -1668,7 +1927,8 @@ class RedditTelegramBot:
             message += f"   Channel ID: {channel_id}\n"
             message += f"   Internal ID: {group_id}\n"
             message += f"   Keywords: {keyword_count}\n"
-            message += f"   Subreddits: {subs_text}\n\n"
+            message += f"   Subreddits: {subs_text}\n"
+            message += f"   Blacklist: {blacklist_text}\n\n"
         
         await update.message.reply_text(message)
     
@@ -1837,6 +2097,7 @@ Interactive Menu (Recommended):
    • Select group
    • Add/Remove keywords via buttons
                    • Add/Remove subreddits (default All if none set)
+   • Manage subreddit blacklist to block specific subs
    • List, clear, or toggle group
    • No need to remember group IDs
 
