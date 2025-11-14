@@ -72,6 +72,9 @@ class RedditTelegramBot:
         # Temporary state for managing subreddit blacklist
         self.pending_subreddit_blacklist_add: Dict[int, int] = {}
         self.pending_subreddit_blacklist_remove: Dict[int, int] = {}
+        # Temporary state for managing case-sensitive keywords
+        self.pending_case_keyword_add: Dict[int, int] = {}  # user_id -> selected_group_id
+        self.pending_case_keyword_remove: Dict[int, int] = {}  # user_id -> selected_group_id
         self.menu_state: Dict[int, str] = {}  # user_id -> current_menu_state
         
         # Use persistent data directory (works on Render with persistent disk, or local ./data directory)
@@ -136,6 +139,7 @@ class RedditTelegramBot:
                     self.groups[group_id] = {
                         'name': group_info.get('name', f'Group {group_id}'),
                         'keywords': set(group_info.get('keywords', [])),
+                        'case_sensitive_keywords': set(group_info.get('case_sensitive_keywords', [])),  # Case-sensitive keywords
                         # Empty or missing subreddits means ALL subreddits
                         'subreddits': set(group_info.get('subreddits', [])),
                         'subreddit_blacklist': set(
@@ -163,6 +167,7 @@ class RedditTelegramBot:
                     self.groups[self.owner_chat_id] = {
                         'name': 'Control Group (Owner)',
                         'keywords': set(),
+                        'case_sensitive_keywords': set(),
                         'subreddits': set(),
                         'subreddit_blacklist': set(),
                         'enabled': True,
@@ -178,6 +183,7 @@ class RedditTelegramBot:
                     self.owner_chat_id: {
                         'name': 'Control Group (Owner)',
                         'keywords': set(),
+                        'case_sensitive_keywords': set(),
                         'subreddits': set(),
                         'subreddit_blacklist': set(),
                         'enabled': True,
@@ -194,6 +200,7 @@ class RedditTelegramBot:
                 self.owner_chat_id: {
                     'name': 'Control Group (Owner)',
                     'keywords': set(),
+                    'case_sensitive_keywords': set(),
                     'subreddits': set(),
                     'subreddit_blacklist': set(),
                     'enabled': True,
@@ -267,6 +274,7 @@ class RedditTelegramBot:
                 groups_data[str(group_id)] = {
                     'name': group_info['name'],
                     'keywords': list(group_info['keywords']),
+                    'case_sensitive_keywords': list(group_info.get('case_sensitive_keywords', set())),
                     'subreddits': list(group_info.get('subreddits', set())),
                     'subreddit_blacklist': list(group_info.get('subreddit_blacklist', set())),
                     'enabled': group_info['enabled'],
@@ -325,6 +333,13 @@ class RedditTelegramBot:
             return False
         pattern = r'\b' + re.escape(phrase.lower()) + r'\b'
         return bool(re.search(pattern, text.lower()))
+    
+    def contains_phrase_case_sensitive(self, text: str, phrase: str) -> bool:
+        """Check if text contains the exact phrase (case-sensitive)"""
+        if not text or not phrase:
+            return False
+        pattern = r'\b' + re.escape(phrase) + r'\b'
+        return bool(re.search(pattern, text))
     
     def format_notification(self, item, keyword: str, item_type: str) -> str:
         """Format notification message"""
@@ -500,10 +515,10 @@ class RedditTelegramBot:
         
         self.last_reddit_request = time.time()
 
-    async def search_posts(self, group_id: int, keyword: str):
+    async def search_posts(self, group_id: int, keyword: str, case_sensitive: bool = False):
         """Search Reddit posts for keyword for a specific group"""
         try:
-            logger.info(f"Searching posts for keyword: {keyword} (Group: {group_id})")
+            logger.info(f"Searching posts for keyword: {keyword} (Group: {group_id}, Case-sensitive: {case_sensitive})")
             
             # Initialize processed items set for this group if not exists
             if group_id not in self.processed_items:
@@ -518,6 +533,9 @@ class RedditTelegramBot:
             targets = list(subreddits) if subreddits else ['all']
 
             new_matches = 0
+
+            # Choose matching function based on case sensitivity
+            match_func = self.contains_phrase_case_sensitive if case_sensitive else self.contains_phrase
 
             for sr in targets:
                 if sr in blacklist:
@@ -535,13 +553,13 @@ class RedditTelegramBot:
                         if post.id in self.processed_items[group_id]:
                             continue
 
-                        # Validate exact phrase match
-                        title_match = self.contains_phrase(post.title, keyword)
+                        # Validate exact phrase match (case-sensitive or case-insensitive)
+                        title_match = match_func(post.title, keyword)
                         body_match = False
 
                         try:
                             if hasattr(post, 'selftext') and post.selftext:
-                                body_match = self.contains_phrase(post.selftext, keyword)
+                                body_match = match_func(post.selftext, keyword)
                         except AttributeError:
                             pass
 
@@ -587,10 +605,10 @@ class RedditTelegramBot:
         except Exception as e:
             logger.error(f"Error searching posts for '{keyword}' (Group {group_id}): {e}")
 
-    async def search_comments_via_posts(self, group_id: int, keyword: str):
+    async def search_comments_via_posts(self, group_id: int, keyword: str, case_sensitive: bool = False):
         """Search for comments by finding recent posts and checking their comments"""
         try:
-            logger.info(f"Searching comments (via posts) for keyword: {keyword} (Group: {group_id})")
+            logger.info(f"Searching comments (via posts) for keyword: {keyword} (Group: {group_id}, Case-sensitive: {case_sensitive})")
             
             if group_id not in self.processed_items:
                 self.processed_items[group_id] = set()
@@ -603,6 +621,9 @@ class RedditTelegramBot:
             targets = list(subreddits) if subreddits else ['all']
 
             new_matches = 0
+            
+            # Choose matching function based on case sensitivity
+            match_func = self.contains_phrase_case_sensitive if case_sensitive else self.contains_phrase
 
             # Iterate target subreddits
             for sr in targets:
@@ -639,7 +660,7 @@ class RedditTelegramBot:
                             try:
                                 if comment.id in self.processed_items[group_id]:
                                     continue
-                                if hasattr(comment, 'body') and self.contains_phrase(comment.body, keyword):
+                                if hasattr(comment, 'body') and match_func(comment.body, keyword):
                                     # Determine comment subreddit
                                     try:
                                         c_sr = str(comment.subreddit).lower()
@@ -709,14 +730,31 @@ class RedditTelegramBot:
                             if blacklist and c_sr in blacklist:
                                 continue
 
-                            # Check against all keywords for this group
+                            # Check against all regular (case-insensitive) keywords for this group
+                            matched = False
+                            matched_keyword = None
+                            
                             for keyword in list(group_info['keywords']):
                                 if hasattr(comment, 'body') and self.contains_phrase(comment.body, keyword):
-                                    message = self.format_notification(comment, keyword, "comment")
-                                    await self.send_notification_to_group(group_id, message)
-                                    self.processed_items[group_id].add(comment.id)
-                                    logger.info(f"Stream found matching comment: {comment.id} for group {group_id}, keyword: {keyword}")
-                                    break  # Only notify once per comment per group
+                                    matched = True
+                                    matched_keyword = keyword
+                                    break  # Found a match, stop checking more regular keywords
+                            
+                            # If no regular keyword match, check case-sensitive keywords
+                            if not matched:
+                                case_keywords = group_info.get('case_sensitive_keywords', set())
+                                for keyword in list(case_keywords):
+                                    if hasattr(comment, 'body') and self.contains_phrase_case_sensitive(comment.body, keyword):
+                                        matched = True
+                                        matched_keyword = keyword
+                                        break  # Found a match, stop checking more case-sensitive keywords
+                            
+                            # Notify once per comment per group if any keyword matched
+                            if matched and matched_keyword:
+                                message = self.format_notification(comment, matched_keyword, "comment")
+                                await self.send_notification_to_group(group_id, message)
+                                self.processed_items[group_id].add(comment.id)
+                                logger.info(f"Stream found matching comment: {comment.id} for group {group_id}, keyword: {matched_keyword}")
                         
                     except Exception as e:
                         logger.error(f"Error processing streamed comment: {e}")
@@ -733,19 +771,19 @@ class RedditTelegramBot:
                     self.reddit = None
                 await asyncio.sleep(30)  # Wait before retrying
     
-    async def search_keyword_for_group(self, group_id: int, keyword: str):
+    async def search_keyword_for_group(self, group_id: int, keyword: str, case_sensitive: bool = False):
         """Comprehensive search for a keyword in both posts and comments for a specific group"""
         try:
             if not self.reddit:
                 await self.setup_reddit()
             
-            logger.info(f"Starting comprehensive search for: {keyword} (Group: {group_id})")
+            logger.info(f"Starting comprehensive search for: {keyword} (Group: {group_id}, Case-sensitive: {case_sensitive})")
             
             # Search posts
-            await self.search_posts(group_id, keyword)
+            await self.search_posts(group_id, keyword, case_sensitive)
             
             # Search comments via recent posts
-            await self.search_comments_via_posts(group_id, keyword)
+            await self.search_comments_via_posts(group_id, keyword, case_sensitive)
             
             # Update last search time
             search_key = f"{group_id}:{keyword}"
@@ -764,22 +802,35 @@ class RedditTelegramBot:
                 await self.setup_reddit()
             
             total_keywords = sum(len(g['keywords']) for g in self.groups.values() if g['enabled'])
-            if total_keywords == 0:
+            total_case_keywords = sum(len(g.get('case_sensitive_keywords', set())) for g in self.groups.values() if g['enabled'])
+            
+            if total_keywords == 0 and total_case_keywords == 0:
                 logger.info("No keywords to monitor across all groups")
                 return
             
-            logger.info(f"Starting search for {total_keywords} keywords across {len(self.groups)} groups...")
+            logger.info(f"Starting search for {total_keywords} regular + {total_case_keywords} case-sensitive keywords across {len(self.groups)} groups...")
             
             for group_id, group_info in self.groups.items():
                 if not group_info['enabled']:
                     continue
                 
+                # Search regular (case-insensitive) keywords
                 for keyword in list(group_info['keywords']):
                     try:
-                        await self.search_keyword_for_group(group_id, keyword)
+                        await self.search_keyword_for_group(group_id, keyword, case_sensitive=False)
                         
                     except Exception as e:
                         logger.error(f"Error processing keyword '{keyword}' for group {group_id}: {e}")
+                        continue
+                
+                # Search case-sensitive keywords
+                case_keywords = group_info.get('case_sensitive_keywords', set())
+                for keyword in list(case_keywords):
+                    try:
+                        await self.search_keyword_for_group(group_id, keyword, case_sensitive=True)
+                        
+                    except Exception as e:
+                        logger.error(f"Error processing case-sensitive keyword '{keyword}' for group {group_id}: {e}")
                         continue
             
             # Trim processed items in memory if needed
@@ -1146,6 +1197,7 @@ class RedditTelegramBot:
                 
                 group_info = self.groups[group_id]
                 keyword_count = len(group_info['keywords'])
+                case_keyword_count = len(group_info.get('case_sensitive_keywords', set()))
                 subs = group_info.get('subreddits', set())
                 subs_status = f"{len(subs)} subs" if subs else "All subreddits"
                 blacklist = group_info.get('subreddit_blacklist', set())
@@ -1160,6 +1212,7 @@ class RedditTelegramBot:
                     [InlineKeyboardButton("➖ Remove Keywords", callback_data=f"remove_kw:{group_id}")],
                     [InlineKeyboardButton("📋 List Keywords", callback_data=f"list_kw:{group_id}")],
                     [InlineKeyboardButton("🗑️ Clear All Keywords", callback_data=f"clear_kw:{group_id}")],
+                    [InlineKeyboardButton("🔤 Specify Case", callback_data=f"case_menu:{group_id}")],
                     [InlineKeyboardButton("➕ Add Subreddit", callback_data=f"add_sr:{group_id}")],
                     [InlineKeyboardButton("➖ Remove Subreddit", callback_data=f"remove_sr:{group_id}")],
                     [InlineKeyboardButton("📋 List Subreddits", callback_data=f"list_sr:{group_id}")],
@@ -1175,6 +1228,7 @@ class RedditTelegramBot:
                 message += f"Channel ID: {channel_id}\n"
                 message += f"Status: {status}\n"
                 message += f"Keywords: {keyword_count}\n"
+                message += f"Case-Sensitive: {case_keyword_count}\n"
                 message += f"Subreddits: {subs_status}\n"
                 message += f"Blacklist: {blacklist_status}\n"
                 message += f"Internal ID: {group_id}"
@@ -1481,6 +1535,132 @@ class RedditTelegramBot:
             )
             logger.info(f"Cleared {count} keywords from group {group_id}")
         
+        # Case-sensitive keywords menu
+        elif data.startswith("case_menu:"):
+            group_id = int(data.split(":")[1])
+            group_info = self.groups[group_id]
+            case_keywords = group_info.get('case_sensitive_keywords', set())
+            count = len(case_keywords)
+            
+            keyboard = [
+                [InlineKeyboardButton("➕ Add Case-Sensitive Keyword", callback_data=f"add_case_kw:{group_id}")],
+                [InlineKeyboardButton("➖ Remove Case-Sensitive Keyword", callback_data=f"remove_case_kw:{group_id}")],
+                [InlineKeyboardButton("📋 List Case-Sensitive Keywords", callback_data=f"list_case_kw:{group_id}")],
+                [InlineKeyboardButton("🗑️ Clear All Case-Sensitive Keywords", callback_data=f"clear_case_kw:{group_id}")],
+                [InlineKeyboardButton("« Back", callback_data=f"manage_group:{group_id}")]
+            ]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            
+            message = f"Case-Sensitive Keywords for: {group_info['name']}\n\n"
+            if count == 0:
+                message += "No case-sensitive keywords configured.\n\n"
+            else:
+                formatted = '\n  '.join(sorted(case_keywords))
+                message += f"Case-Sensitive Keywords ({count}):\n  {formatted}\n\n"
+            message += "Case-sensitive keywords match exactly as typed (e.g., 'CdQ' only matches 'CdQ', not 'cdq' or 'CDQ')."
+            
+            await query.edit_message_text(message, reply_markup=reply_markup)
+        
+        # Add case-sensitive keyword flow
+        elif data.startswith("add_case_kw:"):
+            group_id = int(data.split(":")[1])
+            self.pending_case_keyword_add[user_id] = group_id
+            self.menu_state[user_id] = "adding_case_keywords"
+            
+            group_name = self.groups[group_id]['name']
+            current_keywords = self.groups[group_id].get('case_sensitive_keywords', set())
+            
+            keywords_text = "\n  ".join(sorted(current_keywords)) if current_keywords else "None"
+            
+            keyboard = [[InlineKeyboardButton("« Cancel", callback_data=f"case_menu:{group_id}")]]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            
+            await query.edit_message_text(
+                f"Adding case-sensitive keywords to: {group_name}\n\n"
+                f"Current case-sensitive keywords:\n  {keywords_text}\n\n"
+                f"Send keywords with exact case you want to match:\n"
+                f"Example: CdQ, CDQ, Tesla (will only match exactly as typed)\n\n"
+                f"Separate multiple keywords with commas.",
+                reply_markup=reply_markup
+            )
+        
+        # Remove case-sensitive keyword flow
+        elif data.startswith("remove_case_kw:"):
+            group_id = int(data.split(":")[1])
+            case_keywords = self.groups[group_id].get('case_sensitive_keywords', set())
+            
+            if not case_keywords:
+                keyboard = [[InlineKeyboardButton("« Back", callback_data=f"case_menu:{group_id}")]]
+                reply_markup = InlineKeyboardMarkup(keyboard)
+                await query.edit_message_text(
+                    f"No case-sensitive keywords to remove from {self.groups[group_id]['name']}",
+                    reply_markup=reply_markup
+                )
+                return
+            
+            self.pending_case_keyword_remove[user_id] = group_id
+            self.menu_state[user_id] = "removing_case_keywords"
+            
+            group_name = self.groups[group_id]['name']
+            current_keywords = sorted(case_keywords)
+            keywords_text = "\n  ".join(current_keywords)
+            
+            keyboard = [[InlineKeyboardButton("« Cancel", callback_data=f"case_menu:{group_id}")]]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            
+            await query.edit_message_text(
+                f"Removing case-sensitive keywords from: {group_name}\n\n"
+                f"Current case-sensitive keywords:\n  {keywords_text}\n\n"
+                f"Send keywords to remove (comma-separated, match exact case):\n"
+                f"Example: CdQ, CDQ",
+                reply_markup=reply_markup
+            )
+        
+        # List case-sensitive keywords
+        elif data.startswith("list_case_kw:"):
+            group_id = int(data.split(":")[1])
+            case_keywords = sorted(self.groups[group_id].get('case_sensitive_keywords', set()))
+            
+            if not case_keywords:
+                content = "No case-sensitive keywords configured."
+            else:
+                content = "\n  ".join(case_keywords)
+            
+            keyboard = [[InlineKeyboardButton("« Back", callback_data=f"case_menu:{group_id}")]]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            
+            message = f"{self.groups[group_id]['name']}\n\n"
+            message += f"Case-Sensitive Keywords ({len(case_keywords)}):\n  {content}"
+            
+            await query.edit_message_text(message, reply_markup=reply_markup)
+        
+        # Clear case-sensitive keywords
+        elif data.startswith("clear_case_kw:"):
+            group_id = int(data.split(":")[1])
+            case_keywords = self.groups[group_id].get('case_sensitive_keywords', set())
+            count = len(case_keywords)
+            
+            if count == 0:
+                keyboard = [[InlineKeyboardButton("« Back", callback_data=f"case_menu:{group_id}")]]
+                reply_markup = InlineKeyboardMarkup(keyboard)
+                await query.edit_message_text(
+                    f"No case-sensitive keywords to clear in {self.groups[group_id]['name']}",
+                    reply_markup=reply_markup
+                )
+                return
+            
+            self.groups[group_id]['case_sensitive_keywords'] = set()
+            self.save_data()
+            
+            keyboard = [[InlineKeyboardButton("« Back", callback_data=f"case_menu:{group_id}")]]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            
+            await query.edit_message_text(
+                f"Cleared {count} case-sensitive keywords from {self.groups[group_id]['name']}",
+                reply_markup=reply_markup
+            )
+            logger.info(f"Cleared {count} case-sensitive keywords from group {group_id}")
+        
         # Toggle group
         elif data.startswith("toggle:"):
             group_id = int(data.split(":")[1])
@@ -1718,6 +1898,89 @@ class RedditTelegramBot:
             await update.message.reply_text(response, reply_markup=reply_markup)
             logger.info(f"Removed {len(removed)} subreddits from group {group_id}")
     
+        # Adding case-sensitive keywords
+        elif user_id in self.pending_case_keyword_add and menu_state == "adding_case_keywords":
+            group_id = self.pending_case_keyword_add[user_id]
+            
+            text = update.message.text
+            keywords = [kw.strip() for kw in text.split(',') if kw.strip()]  # Keep original case!
+            
+            if not keywords:
+                await update.message.reply_text("No valid keywords provided. Please try again.")
+                return
+            
+            if 'case_sensitive_keywords' not in self.groups[group_id]:
+                self.groups[group_id]['case_sensitive_keywords'] = set()
+            
+            added = []
+            skipped = []
+            for keyword in keywords:
+                if keyword in self.groups[group_id]['case_sensitive_keywords']:
+                    skipped.append(keyword)
+                else:
+                    self.groups[group_id]['case_sensitive_keywords'].add(keyword)
+                    added.append(keyword)
+            
+            # Clear pending state
+            del self.pending_case_keyword_add[user_id]
+            del self.menu_state[user_id]
+            
+            self.save_data()
+            
+            response = f"Case-sensitive keywords added to '{self.groups[group_id]['name']}':\n\n"
+            if added:
+                response += "Added:\n  " + "\n  ".join(added)
+            if skipped:
+                response += "\n\nSkipped (already exists):\n  " + "\n  ".join(skipped)
+            
+            keyboard = [[InlineKeyboardButton("« Back to Menu", callback_data=f"case_menu:{group_id}")]]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            
+            await update.message.reply_text(response, reply_markup=reply_markup)
+            logger.info(f"Added {len(added)} case-sensitive keywords to group {group_id}")
+        
+        # Removing case-sensitive keywords
+        elif user_id in self.pending_case_keyword_remove and menu_state == "removing_case_keywords":
+            group_id = self.pending_case_keyword_remove[user_id]
+            
+            text = update.message.text
+            keywords = [kw.strip() for kw in text.split(',') if kw.strip()]  # Keep original case!
+            
+            if not keywords:
+                await update.message.reply_text("No valid keywords provided. Please try again.")
+                return
+            
+            if 'case_sensitive_keywords' not in self.groups[group_id] or not self.groups[group_id]['case_sensitive_keywords']:
+                await update.message.reply_text("No case-sensitive keywords configured for this group.")
+                return
+            
+            removed = []
+            not_found = []
+            for keyword in keywords:
+                if keyword in self.groups[group_id]['case_sensitive_keywords']:
+                    self.groups[group_id]['case_sensitive_keywords'].remove(keyword)
+                    removed.append(keyword)
+                else:
+                    not_found.append(keyword)
+            
+            # Clear pending state
+            del self.pending_case_keyword_remove[user_id]
+            del self.menu_state[user_id]
+            
+            self.save_data()
+            
+            response = f"Case-sensitive keywords updated for '{self.groups[group_id]['name']}':\n\n"
+            if removed:
+                response += "Removed:\n  " + "\n  ".join(removed)
+            if not_found:
+                response += "\n\nNot found:\n  " + "\n  ".join(not_found)
+            
+            keyboard = [[InlineKeyboardButton("« Back to Menu", callback_data=f"case_menu:{group_id}")]]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            
+            await update.message.reply_text(response, reply_markup=reply_markup)
+            logger.info(f"Removed {len(removed)} case-sensitive keywords from group {group_id}")
+        
         # Adding blacklist subreddits
         elif user_id in self.pending_subreddit_blacklist_add and menu_state == "adding_blacklist":
             group_id = self.pending_subreddit_blacklist_add[user_id]
