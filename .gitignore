@@ -3,3 +3,5 @@
 
 # Bot data
 bot_data.json
+data/
+bot_data_env_export.txt

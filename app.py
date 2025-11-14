@@ -74,7 +74,13 @@ class RedditTelegramBot:
         self.pending_subreddit_blacklist_remove: Dict[int, int] = {}
         self.menu_state: Dict[int, str] = {}  # user_id -> current_menu_state
         
-        self.data_file = 'bot_data.json'
+        # Use persistent data directory (works on Render with persistent disk, or local ./data directory)
+        self.data_dir = os.getenv('DATA_DIR', './data')
+        # Ensure data directory exists
+        os.makedirs(self.data_dir, exist_ok=True)
+        
+        self.data_file = os.path.join(self.data_dir, 'bot_data.json')
+        self.data_env_var = 'BOT_DATA_JSON'  # Environment variable for persistent storage (fallback)
         
         # Rate limiting for notifications
         self.notification_delay = 3  # seconds between notifications
@@ -100,58 +106,72 @@ class RedditTelegramBot:
         self.load_data()
 
     def load_data(self):
-        """Load groups, keywords and processed items from file"""
+        """Load groups, keywords and processed items from environment variable or file"""
         try:
-            if os.path.exists(self.data_file):
+            data = None
+            
+            # Try loading from environment variable first (persists across Render deploys)
+            env_data = os.getenv(self.data_env_var)
+            if env_data:
+                try:
+                    data = json.loads(env_data)
+                    logger.info("Loaded data from environment variable")
+                except json.JSONDecodeError as e:
+                    logger.warning(f"Failed to parse environment variable data: {e}, falling back to file")
+            
+            # Fall back to file if environment variable not available
+            if data is None and os.path.exists(self.data_file):
                 with open(self.data_file, 'r') as f:
                     data = json.load(f)
-                    
-                    # Load groups with keywords as sets
-                    groups_data = data.get('groups', {})
-                    self.groups = {}
-                    for group_id_str, group_info in groups_data.items():
-                        group_id = int(group_id_str)
-                        # Backward compatibility: default to telegram if platform not specified
-                        platform = group_info.get('platform', 'telegram')
-                        self.groups[group_id] = {
-                            'name': group_info.get('name', f'Group {group_id}'),
-                            'keywords': set(group_info.get('keywords', [])),
-                            # Empty or missing subreddits means ALL subreddits
-                            'subreddits': set(group_info.get('subreddits', [])),
-                            'subreddit_blacklist': set(
-                                s.lower() for s in group_info.get('subreddit_blacklist', [])
-                            ),
-                            'enabled': group_info.get('enabled', True),
-                            'platform': platform,
-                            'channel_id': group_info.get('channel_id', str(group_id)),
-                            'workspace_id': group_info.get('workspace_id', '')  # For slack groups
-                        }
-                    
-                    # Load Slack workspaces
-                    self.slack_workspaces = data.get('slack_workspaces', {})
-                    
-                    # Load processed items per group
-                    processed_data = data.get('processed_items', {})
-                    self.processed_items = {}
-                    for group_id_str, items in processed_data.items():
-                        self.processed_items[int(group_id_str)] = set(items)
-                    
-                    self.last_search_time = data.get('last_search_time', {})
-                    
-                    # Ensure owner's group exists (always Telegram)
-                    if self.owner_chat_id not in self.groups:
-                        self.groups[self.owner_chat_id] = {
-                            'name': 'Control Group (Owner)',
-                            'keywords': set(),
-                            'subreddits': set(),
-                            'subreddit_blacklist': set(),
-                            'enabled': True,
-                            'platform': 'telegram',
-                            'channel_id': str(self.owner_chat_id)
-                        }
-                    
-                    total_keywords = sum(len(g['keywords']) for g in self.groups.values())
-                    logger.info(f"Loaded {len(self.groups)} groups with {total_keywords} total keywords")
+                    logger.info("Loaded data from file")
+            
+            if data:
+                # Load groups with keywords as sets
+                groups_data = data.get('groups', {})
+                self.groups = {}
+                for group_id_str, group_info in groups_data.items():
+                    group_id = int(group_id_str)
+                    # Backward compatibility: default to telegram if platform not specified
+                    platform = group_info.get('platform', 'telegram')
+                    self.groups[group_id] = {
+                        'name': group_info.get('name', f'Group {group_id}'),
+                        'keywords': set(group_info.get('keywords', [])),
+                        # Empty or missing subreddits means ALL subreddits
+                        'subreddits': set(group_info.get('subreddits', [])),
+                        'subreddit_blacklist': set(
+                            s.lower() for s in group_info.get('subreddit_blacklist', [])
+                        ),
+                        'enabled': group_info.get('enabled', True),
+                        'platform': platform,
+                        'channel_id': group_info.get('channel_id', str(group_id)),
+                        'workspace_id': group_info.get('workspace_id', '')  # For slack groups
+                    }
+                
+                # Load Slack workspaces
+                self.slack_workspaces = data.get('slack_workspaces', {})
+                
+                # Load processed items per group
+                processed_data = data.get('processed_items', {})
+                self.processed_items = {}
+                for group_id_str, items in processed_data.items():
+                    self.processed_items[int(group_id_str)] = set(items)
+                
+                self.last_search_time = data.get('last_search_time', {})
+                
+                # Ensure owner's group exists (always Telegram)
+                if self.owner_chat_id not in self.groups:
+                    self.groups[self.owner_chat_id] = {
+                        'name': 'Control Group (Owner)',
+                        'keywords': set(),
+                        'subreddits': set(),
+                        'subreddit_blacklist': set(),
+                        'enabled': True,
+                        'platform': 'telegram',
+                        'channel_id': str(self.owner_chat_id)
+                    }
+                
+                total_keywords = sum(len(g['keywords']) for g in self.groups.values())
+                logger.info(f"Loaded {len(self.groups)} groups with {total_keywords} total keywords")
             else:
                 # Initialize with owner's group (always Telegram)
                 self.groups = {
@@ -167,7 +187,7 @@ class RedditTelegramBot:
                 }
                 self.processed_items = {}
                 self.last_search_time = {}
-                logger.info("No existing data file found, starting fresh with owner's group")
+                logger.info("No existing data found, starting fresh with owner's group")
         except Exception as e:
             logger.error(f"Error loading data: {e}")
             self.groups = {
@@ -234,7 +254,7 @@ class RedditTelegramBot:
             # Don't raise - Slack is optional
     
     def save_data(self):
-        """Save groups, keywords and processed items to file"""
+        """Save groups, keywords and processed items to environment variable and file"""
         try:
             # Trim processed items during save
             for group_id in list(self.processed_items.keys()):
@@ -267,8 +287,24 @@ class RedditTelegramBot:
                 'slack_workspaces': self.slack_workspaces
             }
             
-            with open(self.data_file, 'w') as f:
-                json.dump(data, f, indent=2)
+            # Save to file (for local development and backup)
+            try:
+                with open(self.data_file, 'w') as f:
+                    json.dump(data, f, indent=2)
+                logger.debug("Saved data to file")
+            except Exception as e:
+                logger.warning(f"Failed to save data to file: {e}")
+            
+            # Save compact JSON export (for manual environment variable updates on Render)
+            try:
+                data_json = json.dumps(data, separators=(',', ':'))  # Compact JSON for env var
+                env_file = os.path.join(self.data_dir, 'bot_data_env_export.txt')
+                with open(env_file, 'w') as f:
+                    f.write(data_json)
+                logger.debug(f"Saved data export to {env_file} - copy this to BOT_DATA_JSON env var on Render if needed")
+            except Exception as e:
+                logger.warning(f"Failed to save data export file: {e}")
+                
         except Exception as e:
             logger.error(f"Error saving data: {e}")
     
@@ -2064,6 +2100,82 @@ class RedditTelegramBot:
         
         await update.message.reply_text(status_msg)
     
+    async def export_data(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Export bot data for manual environment variable backup (Owner only)"""
+        chat_id = update.effective_chat.id
+        
+        if not self.is_owner(chat_id):
+            await update.message.reply_text("You don't have permission to use this command. Please contact the bot owner.")
+            return
+        
+        try:
+            # Prepare data for export
+            groups_data = {}
+            for group_id, group_info in self.groups.items():
+                groups_data[str(group_id)] = {
+                    'name': group_info['name'],
+                    'keywords': list(group_info['keywords']),
+                    'subreddits': list(group_info.get('subreddits', set())),
+                    'subreddit_blacklist': list(group_info.get('subreddit_blacklist', set())),
+                    'enabled': group_info['enabled'],
+                    'platform': group_info.get('platform', 'telegram'),
+                    'channel_id': group_info.get('channel_id', str(group_id)),
+                    'workspace_id': group_info.get('workspace_id', '')
+                }
+            
+            processed_data = {}
+            for group_id, items in self.processed_items.items():
+                processed_data[str(group_id)] = list(items)
+            
+            data = {
+                'groups': groups_data,
+                'processed_items': processed_data,
+                'last_search_time': self.last_search_time,
+                'slack_workspaces': self.slack_workspaces
+            }
+            
+            # Create compact JSON for environment variable
+            data_json = json.dumps(data, separators=(',', ':'))
+            
+            # Save to file
+            self.save_data()  # This also creates the export file
+            
+            # Send instructions and the JSON (in parts if too long)
+            instructions = (
+                "📦 Bot Data Export\n\n"
+                "To preserve your data on Render:\n\n"
+                "1. Copy the JSON below\n"
+                "2. Go to Render Dashboard → Your Service → Environment\n"
+                "3. Add/Update environment variable: BOT_DATA_JSON\n"
+                "4. Paste the JSON as the value\n"
+                "5. Save and redeploy\n\n"
+                "Your data will persist across deployments! ✅\n\n"
+                f"Data directory: {self.data_dir}\n"
+                f"Export file: {os.path.join(self.data_dir, 'bot_data_env_export.txt')}\n\n"
+                "Current data summary:\n"
+                f"• Groups: {len(self.groups)}\n"
+                f"• Total keywords: {sum(len(g['keywords']) for g in self.groups.values())}\n"
+                f"• Slack workspaces: {len(self.slack_workspaces)}\n\n"
+                "JSON (copy this):\n"
+            )
+            
+            # Split message if too long (Telegram limit is 4096 characters)
+            if len(instructions) + len(data_json) > 4000:
+                await update.message.reply_text(instructions)
+                # Send JSON in chunks if needed
+                chunk_size = 4000
+                for i in range(0, len(data_json), chunk_size):
+                    chunk = data_json[i:i+chunk_size]
+                    await update.message.reply_text(f"`{chunk}`", parse_mode='Markdown')
+            else:
+                await update.message.reply_text(instructions + f"`{data_json}`", parse_mode='Markdown')
+            
+            logger.info("Data export requested by owner")
+            
+        except Exception as e:
+            logger.error(f"Error exporting data: {e}")
+            await update.message.reply_text(f"Error exporting data: {e}")
+    
     async def help_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Show help message"""
         chat_id = update.effective_chat.id
@@ -2109,6 +2221,7 @@ Direct Commands (Advanced):
 
 Information:
 /status - Show bot status
+/exportdata - Export bot data for Render deployment backup
 /help - Show this help message
 
 Features:
@@ -2189,6 +2302,7 @@ For assistance, please contact the bot owner.
         app.add_handler(CommandHandler("cleargroup", self.cleargroup))
         app.add_handler(CommandHandler("togglegroup", self.togglegroup))
         app.add_handler(CommandHandler("status", self.status))
+        app.add_handler(CommandHandler("exportdata", self.export_data))
         app.add_handler(CommandHandler("help", self.help_command))
         app.add_handler(CommandHandler("start", self.help_command))
         
