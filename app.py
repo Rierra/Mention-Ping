@@ -97,6 +97,8 @@ class RedditTelegramBot:
         self.pending_notifications = []
         self.notification_lock = asyncio.Lock()
         
+        self.message_separator = "\n\n__________"
+
         # Sessions
         self.telegram_session: Optional[aiohttp.ClientSession] = None
         self.reddit_session: Optional[aiohttp.ClientSession] = None
@@ -118,7 +120,6 @@ class RedditTelegramBot:
     def load_data(self):
         """Load groups, keywords and processed items from environment variable or file"""
         try:
-            separator = "\n\n__________"
             data = None
             
             # Try loading from environment variable first (persists across Render deploys)
@@ -394,7 +395,7 @@ class RedditTelegramBot:
             logger.error(f"Error formatting notification: {e}")
             message = f"Keyword: {keyword}\n\nError formatting item details."
         
-        return f"{message.strip()}{separator}"
+        return f"{message.strip()}{self.message_separator}"
     
     async def send_notification_to_group(self, group_id: int, message: str):
         """Queue notification to be sent to specific group with rate limiting"""
