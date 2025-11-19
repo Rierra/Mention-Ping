@@ -77,8 +77,15 @@ class RedditTelegramBot:
         self.pending_case_keyword_remove: Dict[int, int] = {}  # user_id -> selected_group_id
         self.menu_state: Dict[int, str] = {}  # user_id -> current_menu_state
         
-        # Use persistent data directory (works on Render with persistent disk, or local ./data directory)
-        self.data_dir = os.getenv('DATA_DIR', './data')
+        # Resolve data directory (prefers mounted persistent disk at /var/data on Render)
+        preferred_persistent_path = '/var/data'
+        data_dir_env = os.getenv('DATA_DIR')
+        if data_dir_env:
+            self.data_dir = data_dir_env
+        elif os.path.isdir(preferred_persistent_path):
+            self.data_dir = preferred_persistent_path
+        else:
+            self.data_dir = './data'
         # Ensure data directory exists
         os.makedirs(self.data_dir, exist_ok=True)
         
@@ -111,6 +118,7 @@ class RedditTelegramBot:
     def load_data(self):
         """Load groups, keywords and processed items from environment variable or file"""
         try:
+            separator = "\n\n__________"
             data = None
             
             # Try loading from environment variable first (persists across Render deploys)
@@ -386,7 +394,7 @@ class RedditTelegramBot:
             logger.error(f"Error formatting notification: {e}")
             message = f"Keyword: {keyword}\n\nError formatting item details."
         
-        return message
+        return f"{message.strip()}{separator}"
     
     async def send_notification_to_group(self, group_id: int, message: str):
         """Queue notification to be sent to specific group with rate limiting"""
@@ -438,7 +446,6 @@ class RedditTelegramBot:
             data = {
                 'chat_id': chat_id,
                 'text': message,
-                'parse_mode': 'HTML',
                 'disable_web_page_preview': True
             }
             
