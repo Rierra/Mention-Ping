@@ -16,6 +16,8 @@ import html
 from typing import Set, List, Dict, Optional
 from datetime import datetime, timedelta
 
+import export_generator
+
 import asyncpraw
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, ContextTypes, CallbackQueryHandler
@@ -62,6 +64,11 @@ class RedditTelegramBot:
         
         # Slack workspaces storage: workspace_id -> {name: str, token: str}
         self.slack_workspaces: Dict[str, Dict] = {}
+        
+        # Mention history for exports: group_id -> list of mention records (separate per group)
+        self.mention_history: Dict[int, List[Dict]] = {}
+        # Track last export time per group for /export new
+        self.last_export_time: Dict[int, float] = {}
         
         # Temporary state for adding keywords and menu navigation
         self.pending_keyword_add: Dict[int, int] = {}  # user_id -> selected_group_id
@@ -170,6 +177,16 @@ class RedditTelegramBot:
                     self.processed_items[int(group_id_str)] = set(items)
                 
                 self.last_search_time = data.get('last_search_time', {})
+                
+                # Load mention history per group (for exports)
+                mention_data = data.get('mention_history', {})
+                self.mention_history = {}
+                for group_id_str, records in mention_data.items():
+                    self.mention_history[int(group_id_str)] = records
+                
+                # Load last export time per group
+                export_time_data = data.get('last_export_time', {})
+                self.last_export_time = {int(k): v for k, v in export_time_data.items()}
                 
                 # Ensure owner's group exists (always Telegram)
                 if self.owner_chat_id not in self.groups:
@@ -301,7 +318,9 @@ class RedditTelegramBot:
                 'groups': groups_data,
                 'processed_items': processed_data,
                 'last_search_time': self.last_search_time,
-                'slack_workspaces': self.slack_workspaces
+                'slack_workspaces': self.slack_workspaces,
+                'mention_history': {str(k): v for k, v in self.mention_history.items()},
+                'last_export_time': {str(k): v for k, v in self.last_export_time.items()}
             }
             
             # Save to file (for local development and backup)
@@ -396,6 +415,101 @@ class RedditTelegramBot:
             message = f"Keyword: {keyword}\n\nError formatting item details."
         
         return f"{message.strip()}{self.message_separator}"
+    
+    def store_mention(self, group_id: int, item, keyword: str, item_type: str, parent_post_id: str = ""):
+        """Store a mention record for later export.
+        
+        Args:
+            group_id: The group this mention belongs to
+            item: The Reddit post or comment object
+            keyword: The keyword that matched
+            item_type: 'post', 'comment', or 'context_comment'
+            parent_post_id: For context comments, the ID of the parent post
+        """
+        try:
+            if group_id not in self.mention_history:
+                self.mention_history[group_id] = []
+            
+            # Build the record
+            record = {
+                'date': datetime.now().isoformat(),
+                'type': item_type,
+                'subreddit': str(getattr(item, 'subreddit', '')),
+                'author': str(getattr(item, 'author', '[deleted]')),
+                'title': '',
+                'content': '',
+                'keyword_matched': keyword,
+                'url': f"https://reddit.com{getattr(item, 'permalink', '')}",
+                'upvotes': getattr(item, 'score', 0),
+                'comment_count': getattr(item, 'num_comments', 0) if item_type == 'post' else 0,
+                'parent_post_id': parent_post_id
+            }
+            
+            if item_type == 'post':
+                record['title'] = getattr(item, 'title', '')[:500]
+                record['content'] = getattr(item, 'selftext', '')[:2000]
+            else:  # comment or context_comment
+                record['content'] = getattr(item, 'body', '')[:2000]
+                # Try to get parent post title if available
+                try:
+                    if hasattr(item, 'submission') and item.submission:
+                        record['title'] = getattr(item.submission, 'title', '')[:500]
+                except:
+                    pass
+            
+            self.mention_history[group_id].append(record)
+            logger.debug(f"Stored {item_type} mention for group {group_id}, keyword: {keyword}")
+            
+        except Exception as e:
+            logger.error(f"Error storing mention: {e}")
+    
+    async def fetch_and_store_context_comments(self, group_id: int, post, keyword: str):
+        """Fetch all comments on a post and store them as context.
+        
+        Args:
+            group_id: The group this mention belongs to
+            post: The Reddit post object
+            keyword: The keyword that triggered this (for reference)
+        """
+        try:
+            if not hasattr(post, 'comments') or post.comments is None:
+                return
+            
+            # Expand all comments
+            try:
+                await post.comments.replace_more(limit=0)
+            except Exception as e:
+                logger.debug(f"Could not expand comments for context: {e}")
+                return
+            
+            # Get all comments
+            try:
+                comments_list = post.comments.list()
+            except Exception as e:
+                logger.debug(f"Could not get comments list for context: {e}")
+                return
+            
+            if not comments_list:
+                return
+            
+            # Store each comment as context
+            for comment in comments_list:
+                try:
+                    self.store_mention(
+                        group_id=group_id,
+                        item=comment,
+                        keyword=keyword,
+                        item_type='context_comment',
+                        parent_post_id=post.id
+                    )
+                except Exception as e:
+                    logger.debug(f"Error storing context comment: {e}")
+                    continue
+            
+            logger.info(f"Stored {len(comments_list)} context comments for post {post.id}")
+            
+        except Exception as e:
+            logger.error(f"Error fetching context comments: {e}")
     
     async def send_notification_to_group(self, group_id: int, message: str):
         """Queue notification to be sent to specific group with rate limiting"""
@@ -601,6 +715,11 @@ class RedditTelegramBot:
                             await self.send_notification_to_group(group_id, message)
                             self.processed_items[group_id].add(post.id)
                             logger.info(f"Found matching post: {post.id} for group {group_id}")
+                            
+                            # Store for export
+                            self.store_mention(group_id, post, keyword, "post")
+                            # Fetch and store all comments on this post for context
+                            await self.fetch_and_store_context_comments(group_id, post, keyword)
 
                         await asyncio.sleep(0.1)
 
@@ -685,6 +804,9 @@ class RedditTelegramBot:
                                     await self.send_notification_to_group(group_id, message)
                                     self.processed_items[group_id].add(comment.id)
                                     logger.info(f"Found matching comment: {comment.id} for group {group_id}")
+                                    
+                                    # Store for export
+                                    self.store_mention(group_id, comment, keyword, "comment", parent_post_id=post.id)
                             except Exception as e:
                                 logger.error(f"Error processing comment: {e}")
                                 continue
@@ -763,6 +885,9 @@ class RedditTelegramBot:
                                 await self.send_notification_to_group(group_id, message)
                                 self.processed_items[group_id].add(comment.id)
                                 logger.info(f"Stream found matching comment: {comment.id} for group {group_id}, keyword: {matched_keyword}")
+                                
+                                # Store for export
+                                self.store_mention(group_id, comment, matched_keyword, "comment")
                         
                     except Exception as e:
                         logger.error(f"Error processing streamed comment: {e}")
@@ -2447,6 +2572,197 @@ class RedditTelegramBot:
             logger.error(f"Error exporting data: {e}")
             await update.message.reply_text(f"Error exporting data: {e}")
     
+    async def export_mentions(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Export mentions history as CSV and XLSX files.
+        
+        Commands:
+        /export all - All historical data
+        /export new - Since last export
+        /export day - Last 24 hours
+        /export week - Last 7 days
+        /export month - Last 30 days
+        /export YYYY-MM-DD - From date to now
+        /export YYYY-MM-DD-YYYY-MM-DD - Date range
+        """
+        chat_id = update.effective_chat.id
+        user_id = update.effective_user.id
+        
+        # Determine which group this export is for
+        # If owner, they need to specify or we use their control group
+        # If from a client group, use that group's data
+        
+        if self.is_owner(chat_id):
+            # Owner can export for any group - for now, use control group
+            # Future: add group selection
+            group_id = self.owner_chat_id
+        else:
+            # Find the group that matches this chat
+            group_id = None
+            for gid, ginfo in self.groups.items():
+                if ginfo.get('platform') == 'telegram' and ginfo.get('channel_id') == str(chat_id):
+                    group_id = gid
+                    break
+            
+            if group_id is None:
+                await update.message.reply_text("This group is not configured for exports.")
+                return
+        
+        # Parse arguments
+        args = context.args if context.args else []
+        
+        # Get the group's mention history
+        records = self.mention_history.get(group_id, [])
+        
+        if not records:
+            await update.message.reply_text(
+                "📊 No mention data available yet.\n\n"
+                "Mentions will be collected as keywords are detected."
+            )
+            return
+        
+        # Filter based on command
+        filtered_records = records
+        period_desc = "All time"
+        
+        if args:
+            arg = args[0].lower()
+            
+            if arg == 'all':
+                # All records
+                period_desc = "All time"
+                
+            elif arg == 'new':
+                # Since last export
+                last_export = self.last_export_time.get(group_id, 0)
+                if last_export > 0:
+                    last_export_dt = datetime.fromtimestamp(last_export)
+                    filtered_records = export_generator.filter_by_date(records, start_date=last_export_dt)
+                    period_desc = f"Since {last_export_dt.strftime('%b %d, %Y %H:%M')}"
+                else:
+                    period_desc = "All time (first export)"
+                
+                # Update last export time
+                self.last_export_time[group_id] = time.time()
+                self.save_data()
+                
+            elif arg == 'day':
+                filtered_records = export_generator.filter_by_preset(records, 'day')
+                period_desc = "Last 24 hours"
+                
+            elif arg == 'week':
+                filtered_records = export_generator.filter_by_preset(records, 'week')
+                period_desc = "Last 7 days"
+                
+            elif arg == 'month':
+                filtered_records = export_generator.filter_by_preset(records, 'month')
+                period_desc = "Last 30 days"
+                
+            elif '-' in arg and len(arg.split('-')) >= 3:
+                # Parse date or date range
+                parts = arg.split('-')
+                
+                if len(parts) == 3:
+                    # Single date: YYYY-MM-DD
+                    start_date = export_generator.parse_date_arg(arg)
+                    if start_date:
+                        filtered_records = export_generator.filter_by_date(records, start_date=start_date)
+                        period_desc = f"Since {start_date.strftime('%b %d, %Y')}"
+                    else:
+                        await update.message.reply_text("Invalid date format. Use YYYY-MM-DD")
+                        return
+                        
+                elif len(parts) == 6:
+                    # Date range: YYYY-MM-DD-YYYY-MM-DD
+                    start_str = '-'.join(parts[:3])
+                    end_str = '-'.join(parts[3:])
+                    start_date = export_generator.parse_date_arg(start_str)
+                    end_date = export_generator.parse_date_arg(end_str)
+                    
+                    if start_date and end_date:
+                        # Set end_date to end of day
+                        end_date = end_date.replace(hour=23, minute=59, second=59)
+                        filtered_records = export_generator.filter_by_date(records, start_date=start_date, end_date=end_date)
+                        period_desc = f"{start_date.strftime('%b %d, %Y')} - {end_date.strftime('%b %d, %Y')}"
+                    else:
+                        await update.message.reply_text("Invalid date range format. Use YYYY-MM-DD-YYYY-MM-DD")
+                        return
+                else:
+                    await update.message.reply_text(
+                        "Invalid format. Use:\n"
+                        "/export all\n"
+                        "/export new\n"
+                        "/export day\n"
+                        "/export week\n"
+                        "/export month\n"
+                        "/export YYYY-MM-DD\n"
+                        "/export YYYY-MM-DD-YYYY-MM-DD"
+                    )
+                    return
+            else:
+                await update.message.reply_text(
+                    "Invalid option. Use:\n"
+                    "/export all - All data\n"
+                    "/export new - Since last export\n"
+                    "/export day - Last 24 hours\n"
+                    "/export week - Last 7 days\n"
+                    "/export month - Last 30 days\n"
+                    "/export YYYY-MM-DD - From date\n"
+                    "/export YYYY-MM-DD-YYYY-MM-DD - Date range"
+                )
+                return
+        
+        if not filtered_records:
+            await update.message.reply_text(f"📊 No mentions found for: {period_desc}")
+            return
+        
+        try:
+            # Generate files
+            csv_bytes = export_generator.generate_csv_bytes(filtered_records)
+            xlsx_bytes = export_generator.generate_xlsx_bytes(filtered_records)
+            
+            # Get stats
+            stats = export_generator.get_export_stats(filtered_records)
+            
+            # File sizes
+            csv_size = export_generator.get_file_size_str(len(csv_bytes))
+            xlsx_size = export_generator.get_file_size_str(len(xlsx_bytes))
+            
+            # Create message
+            message = (
+                f"📊 Export Complete!\n\n"
+                f"Period: {period_desc}\n"
+                f"Mentions: {stats['mentions']}\n"
+                f"Context Comments: {stats['context_comments']}\n"
+                f"Total Rows: {stats['total_rows']}\n\n"
+                f"📎 CSV: {csv_size}\n"
+                f"📎 XLSX: {xlsx_size}"
+            )
+            
+            # Generate filenames
+            timestamp = datetime.now().strftime('%Y-%m-%d')
+            csv_filename = f"mentions_export_{timestamp}.csv"
+            xlsx_filename = f"mentions_export_{timestamp}.xlsx"
+            
+            # Send message first
+            await update.message.reply_text(message)
+            
+            # Send files
+            import io
+            
+            csv_file = io.BytesIO(csv_bytes)
+            csv_file.name = csv_filename
+            await context.bot.send_document(chat_id=chat_id, document=csv_file, filename=csv_filename)
+            
+            xlsx_file = io.BytesIO(xlsx_bytes)
+            xlsx_file.name = xlsx_filename
+            await context.bot.send_document(chat_id=chat_id, document=xlsx_file, filename=xlsx_filename)
+            
+            logger.info(f"Export completed for group {group_id}: {stats['total_rows']} rows")
+            
+        except Exception as e:
+            logger.error(f"Error generating export: {e}")
+            await update.message.reply_text(f"Error generating export: {e}")
+    
     async def help_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Show help message"""
         chat_id = update.effective_chat.id
@@ -2493,7 +2809,17 @@ Direct Commands (Advanced):
 Information:
 /status - Show bot status
 /exportdata - Export bot data for Render deployment backup
+/export - Export mentions data (see below)
 /help - Show this help message
+
+Export Commands:
+/export all - All historical mentions
+/export new - Since last export
+/export day - Last 24 hours
+/export week - Last 7 days
+/export month - Last 30 days
+/export YYYY-MM-DD - From date
+/export YYYY-MM-DD-YYYY-MM-DD - Date range
 
 Features:
 • Searches ALL Reddit posts for keywords
@@ -2521,12 +2847,16 @@ Reddit to Telegram Monitor Bot
 
 This bot monitors Reddit for specific keywords and sends alerts to this group.
 
-This group is in read-only mode.
-Commands can only be used by the bot owner in the control group.
+Available Commands:
+/export all - Export all mention history
+/export new - Export since last export
+/export day - Export last 24 hours
+/export week - Export last 7 days
+/export month - Export last 30 days
 
-You will receive alerts when keywords match posts or comments on Reddit.
+You will receive both CSV and XLSX files.
 
-For assistance, please contact the bot owner.
+For other assistance, please contact the bot owner.
             """
         
         await update.message.reply_text(help_text.strip())
@@ -2574,6 +2904,7 @@ For assistance, please contact the bot owner.
         app.add_handler(CommandHandler("togglegroup", self.togglegroup))
         app.add_handler(CommandHandler("status", self.status))
         app.add_handler(CommandHandler("exportdata", self.export_data))
+        app.add_handler(CommandHandler("export", self.export_mentions))
         app.add_handler(CommandHandler("help", self.help_command))
         app.add_handler(CommandHandler("start", self.help_command))
         
