@@ -2583,7 +2583,7 @@ class RedditTelegramBot:
         if not context.args:
             await update.message.reply_text(
                 "Usage: /broadcast <message>\n\n"
-                "Example: /broadcast 🆕 New feature available! Try /help for details."
+                "Example: /broadcast New feature available! Try /help for details."
             )
             return
         
@@ -2597,14 +2597,14 @@ class RedditTelegramBot:
             await update.message.reply_text("No client groups to broadcast to.")
             return
         
-        await update.message.reply_text(f"📢 Broadcasting to {len(target_groups)} groups...")
+        await update.message.reply_text(f"Broadcasting to {len(target_groups)} groups...")
         
         success = 0
         failed = 0
         
         for group_id, group_info in target_groups:
             try:
-                await self._send_platform_message(group_id, f"📢 Announcement\n\n{message}")
+                await self._send_platform_message(group_id, f"Announcement\n\n{message}")
                 success += 1
                 await asyncio.sleep(1)  # Rate limiting
             except Exception as e:
@@ -2612,9 +2612,9 @@ class RedditTelegramBot:
                 failed += 1
         
         await update.message.reply_text(
-            f"📢 Broadcast complete!\n\n"
-            f"✅ Sent: {success}\n"
-            f"❌ Failed: {failed}"
+            f"Broadcast complete!\n\n"
+            f"Sent: {success}\n"
+            f"Failed: {failed}"
         )
         logger.info(f"Broadcast sent to {success} groups, {failed} failed")
     
@@ -2661,7 +2661,7 @@ class RedditTelegramBot:
         
         if not records:
             await update.message.reply_text(
-                "📊 No mention data available yet.\n\n"
+                "No mention data available yet.\n\n"
                 "Mentions will be collected as keywords are detected."
             )
             return
@@ -2758,7 +2758,7 @@ class RedditTelegramBot:
                 return
         
         if not filtered_records:
-            await update.message.reply_text(f"📊 No mentions found for: {period_desc}")
+            await update.message.reply_text(f"No mentions found for: {period_desc}")
             return
         
         try:
@@ -2775,13 +2775,13 @@ class RedditTelegramBot:
             
             # Create message
             message = (
-                f"📊 Export Complete!\n\n"
+                f"Export Complete!\n\n"
                 f"Period: {period_desc}\n"
                 f"Mentions: {stats['mentions']}\n"
                 f"Context Comments: {stats['context_comments']}\n"
                 f"Total Rows: {stats['total_rows']}\n\n"
-                f"📎 CSV: {csv_size}\n"
-                f"📎 XLSX: {xlsx_size}"
+                f"CSV: {csv_size}\n"
+                f"XLSX: {xlsx_size}"
             )
             
             # Generate filenames
