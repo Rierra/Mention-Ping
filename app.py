@@ -2572,6 +2572,52 @@ class RedditTelegramBot:
             logger.error(f"Error exporting data: {e}")
             await update.message.reply_text(f"Error exporting data: {e}")
     
+    async def broadcast(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Broadcast a message to all client groups (Owner only)"""
+        chat_id = update.effective_chat.id
+        
+        if not self.is_owner(chat_id):
+            await update.message.reply_text("You don't have permission to use this command.")
+            return
+        
+        if not context.args:
+            await update.message.reply_text(
+                "Usage: /broadcast <message>\n\n"
+                "Example: /broadcast 🆕 New feature available! Try /help for details."
+            )
+            return
+        
+        message = ' '.join(context.args)
+        
+        # Count groups (excluding owner's control group)
+        target_groups = [(gid, ginfo) for gid, ginfo in self.groups.items() 
+                         if gid != self.owner_chat_id and ginfo['enabled']]
+        
+        if not target_groups:
+            await update.message.reply_text("No client groups to broadcast to.")
+            return
+        
+        await update.message.reply_text(f"📢 Broadcasting to {len(target_groups)} groups...")
+        
+        success = 0
+        failed = 0
+        
+        for group_id, group_info in target_groups:
+            try:
+                await self._send_platform_message(group_id, f"📢 Announcement\n\n{message}")
+                success += 1
+                await asyncio.sleep(1)  # Rate limiting
+            except Exception as e:
+                logger.error(f"Failed to broadcast to {group_id}: {e}")
+                failed += 1
+        
+        await update.message.reply_text(
+            f"📢 Broadcast complete!\n\n"
+            f"✅ Sent: {success}\n"
+            f"❌ Failed: {failed}"
+        )
+        logger.info(f"Broadcast sent to {success} groups, {failed} failed")
+    
     async def export_mentions(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Export mentions history as CSV and XLSX files.
         
@@ -2810,6 +2856,7 @@ Information:
 /status - Show bot status
 /exportdata - Export bot data for Render deployment backup
 /export - Export mentions data (see below)
+/broadcast <message> - Send announcement to all client groups
 /help - Show this help message
 
 Export Commands:
@@ -2905,6 +2952,7 @@ For other assistance, please contact the bot owner.
         app.add_handler(CommandHandler("status", self.status))
         app.add_handler(CommandHandler("exportdata", self.export_data))
         app.add_handler(CommandHandler("export", self.export_mentions))
+        app.add_handler(CommandHandler("broadcast", self.broadcast))
         app.add_handler(CommandHandler("help", self.help_command))
         app.add_handler(CommandHandler("start", self.help_command))
         
