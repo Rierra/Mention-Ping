@@ -2621,7 +2621,11 @@ class RedditTelegramBot:
     async def export_mentions(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Export mentions history as CSV and XLSX files.
         
-        Commands:
+        Commands (from control group - can specify group_id):
+        /export <group_id> all - All historical data for specific group
+        /export <group_id> day - Last 24 hours for specific group
+        
+        Commands (from client group or without group_id):
         /export all - All historical data
         /export new - Since last export
         /export day - Last 24 hours
@@ -2633,28 +2637,42 @@ class RedditTelegramBot:
         chat_id = update.effective_chat.id
         user_id = update.effective_user.id
         
+        # Parse arguments
+        args = list(context.args) if context.args else []
+        
         # Determine which group this export is for
-        # If owner, they need to specify or we use their control group
-        # If from a client group, use that group's data
+        target_group_id = None
+        send_to_target = False  # Whether to send files to target group instead of here
         
         if self.is_owner(chat_id):
-            # Owner can export for any group - for now, use control group
-            # Future: add group selection
-            group_id = self.owner_chat_id
+            # Owner can specify target group as first argument
+            if args and (args[0].startswith('-') or args[0].isdigit()):
+                try:
+                    target_group_id = int(args[0])
+                    if target_group_id in self.groups:
+                        args = args[1:]  # Remove group_id from args
+                        send_to_target = True  # Send files to the target group
+                    else:
+                        await update.message.reply_text(f"Group {target_group_id} not found. Use /listgroups to see available groups.")
+                        return
+                except ValueError:
+                    pass
+            
+            # If no target specified, use control group
+            if target_group_id is None:
+                target_group_id = self.owner_chat_id
         else:
-            # Find the group that matches this chat
-            group_id = None
+            # Non-owner: find the group that matches this chat
             for gid, ginfo in self.groups.items():
                 if ginfo.get('platform') == 'telegram' and ginfo.get('channel_id') == str(chat_id):
-                    group_id = gid
+                    target_group_id = gid
                     break
             
-            if group_id is None:
+            if target_group_id is None:
                 await update.message.reply_text("This group is not configured for exports.")
                 return
         
-        # Parse arguments
-        args = context.args if context.args else []
+        group_id = target_group_id
         
         # Get the group's mention history
         records = self.mention_history.get(group_id, [])
@@ -2774,8 +2792,10 @@ class RedditTelegramBot:
             xlsx_size = export_generator.get_file_size_str(len(xlsx_bytes))
             
             # Create message
+            group_name = self.groups.get(group_id, {}).get('name', f'Group {group_id}')
             message = (
                 f"Export Complete!\n\n"
+                f"Group: {group_name}\n"
                 f"Period: {period_desc}\n"
                 f"Mentions: {stats['mentions']}\n"
                 f"Context Comments: {stats['context_comments']}\n"
@@ -2789,19 +2809,75 @@ class RedditTelegramBot:
             csv_filename = f"mentions_export_{timestamp}.csv"
             xlsx_filename = f"mentions_export_{timestamp}.xlsx"
             
-            # Send message first
-            await update.message.reply_text(message)
-            
-            # Send files
-            import io
-            
-            csv_file = io.BytesIO(csv_bytes)
-            csv_file.name = csv_filename
-            await context.bot.send_document(chat_id=chat_id, document=csv_file, filename=csv_filename)
-            
-            xlsx_file = io.BytesIO(xlsx_bytes)
-            xlsx_file.name = xlsx_filename
-            await context.bot.send_document(chat_id=chat_id, document=xlsx_file, filename=xlsx_filename)
+            # Determine where to send files
+            if send_to_target and group_id != chat_id:
+                # Send to the target group
+                target_info = self.groups.get(group_id, {})
+                platform = target_info.get('platform', 'telegram')
+                
+                if platform == 'slack':
+                    # Send to Slack channel
+                    workspace_id = target_info.get('workspace_id', '')
+                    channel_id = target_info.get('channel_id', '')
+                    
+                    if workspace_id in self.slack_clients:
+                        slack_client = self.slack_clients[workspace_id]
+                        
+                        # Send message first
+                        await slack_client.chat_postMessage(channel=channel_id, text=message)
+                        
+                        # Upload CSV
+                        await slack_client.files_upload_v2(
+                            channel=channel_id,
+                            content=csv_bytes.decode('utf-8'),
+                            filename=csv_filename,
+                            title="Mentions Export (CSV)"
+                        )
+                        
+                        # Upload XLSX
+                        await slack_client.files_upload_v2(
+                            channel=channel_id,
+                            file=xlsx_bytes,
+                            filename=xlsx_filename,
+                            title="Mentions Export (Excel)"
+                        )
+                        
+                        # Confirm to owner
+                        await update.message.reply_text(f"Export sent to Slack group: {group_name}")
+                    else:
+                        await update.message.reply_text(f"Slack workspace not connected for group: {group_name}")
+                        return
+                else:
+                    # Send to Telegram group
+                    target_chat_id = int(target_info.get('channel_id', group_id))
+                    
+                    # Send message
+                    await context.bot.send_message(chat_id=target_chat_id, text=message)
+                    
+                    # Send files
+                    import io
+                    csv_file = io.BytesIO(csv_bytes)
+                    csv_file.name = csv_filename
+                    await context.bot.send_document(chat_id=target_chat_id, document=csv_file, filename=csv_filename)
+                    
+                    xlsx_file = io.BytesIO(xlsx_bytes)
+                    xlsx_file.name = xlsx_filename
+                    await context.bot.send_document(chat_id=target_chat_id, document=xlsx_file, filename=xlsx_filename)
+                    
+                    # Confirm to owner
+                    await update.message.reply_text(f"Export sent to group: {group_name}")
+            else:
+                # Send to current chat (owner or same group)
+                await update.message.reply_text(message)
+                
+                import io
+                csv_file = io.BytesIO(csv_bytes)
+                csv_file.name = csv_filename
+                await context.bot.send_document(chat_id=chat_id, document=csv_file, filename=csv_filename)
+                
+                xlsx_file = io.BytesIO(xlsx_bytes)
+                xlsx_file.name = xlsx_filename
+                await context.bot.send_document(chat_id=chat_id, document=xlsx_file, filename=xlsx_filename)
             
             logger.info(f"Export completed for group {group_id}: {stats['total_rows']} rows")
             
