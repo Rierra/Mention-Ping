@@ -24,6 +24,8 @@ from telegram.ext import Application, CommandHandler, ContextTypes, CallbackQuer
 from dotenv import load_dotenv
 from slack_sdk.web.async_client import AsyncWebClient
 from slack_sdk.errors import SlackApiError
+from slack_bolt.async_app import AsyncApp
+from slack_bolt.adapter.socket_mode.async_handler import AsyncSocketModeHandler
 
 # Load environment variables from .env file
 load_dotenv()
@@ -42,6 +44,7 @@ class RedditTelegramBot:
         self.telegram_chat_id = os.getenv('TELEGRAM_CHAT_ID')  # Owner's control group
         self.owner_chat_id = int(self.telegram_chat_id)  # Store as int for comparison
         self.slack_bot_token = os.getenv('SLACK_BOT_TOKEN')  # Optional Slack token
+        self.slack_app_token = os.getenv('SLACK_APP_TOKEN')  # For Socket Mode
         
         self.reddit_client_id = os.getenv('REDDIT_CLIENT_ID')
         self.reddit_client_secret = os.getenv('REDDIT_CLIENT_SECRET')
@@ -285,6 +288,160 @@ class RedditTelegramBot:
         except Exception as e:
             logger.error(f"Failed to initialize Slack API: {e}")
             # Don't raise - Slack is optional
+    
+    async def setup_slack_socket_mode(self):
+        """Set up Slack Socket Mode to receive messages"""
+        if not self.slack_app_token:
+            logger.info("No SLACK_APP_TOKEN configured. Slack message commands disabled.")
+            return None
+        
+        # Find a workspace token to use for the Bolt app
+        bot_token = None
+        for workspace_id, workspace_info in self.slack_workspaces.items():
+            token = workspace_info.get('token')
+            if token:
+                bot_token = token
+                break
+        
+        if not bot_token:
+            logger.info("No Slack workspaces configured. Socket Mode disabled.")
+            return None
+        
+        try:
+            # Create the Bolt async app
+            slack_app = AsyncApp(token=bot_token)
+            
+            # Store reference to self for the handler
+            bot_self = self
+            
+            @slack_app.message()
+            async def handle_message(message, say, client):
+                """Handle incoming Slack messages for export commands"""
+                text = message.get('text', '').strip().lower()
+                channel = message.get('channel', '')
+                
+                # Check if message starts with "export"
+                if not text.startswith('export'):
+                    return
+                
+                # Find which group this channel belongs to
+                group_id = None
+                for gid, ginfo in bot_self.groups.items():
+                    if ginfo.get('platform') == 'slack' and ginfo.get('channel_id') == channel:
+                        group_id = gid
+                        break
+                
+                if group_id is None:
+                    await say("This channel is not configured for exports.")
+                    return
+                
+                # Parse export command
+                parts = text.split()
+                if len(parts) < 2:
+                    await say(
+                        "Export commands:\n"
+                        "`export all` - All historical data\n"
+                        "`export new` - Since last export\n"
+                        "`export day` - Last 24 hours\n"
+                        "`export week` - Last 7 days\n"
+                        "`export month` - Last 30 days"
+                    )
+                    return
+                
+                export_type = parts[1]
+                valid_types = ['all', 'new', 'day', 'week', 'month']
+                
+                if export_type not in valid_types:
+                    await say(f"Invalid export type. Use: {', '.join(valid_types)}")
+                    return
+                
+                # Get records for this group
+                records = bot_self.mention_history.get(group_id, [])
+                
+                if not records:
+                    await say("No mention data available yet. Mentions will be collected as keywords are detected.")
+                    return
+                
+                # Filter records
+                filtered_records = records
+                period_desc = "All time"
+                
+                if export_type == 'all':
+                    period_desc = "All time"
+                elif export_type == 'new':
+                    last_export = bot_self.last_export_time.get(group_id, 0)
+                    if last_export > 0:
+                        from datetime import datetime
+                        last_export_dt = datetime.fromtimestamp(last_export)
+                        filtered_records = export_generator.filter_by_date(records, start_date=last_export_dt)
+                        period_desc = f"Since {last_export_dt.strftime('%b %d, %Y %H:%M')}"
+                    else:
+                        period_desc = "All time (first export)"
+                    bot_self.last_export_time[group_id] = time.time()
+                    bot_self.save_data()
+                elif export_type in ['day', 'week', 'month']:
+                    filtered_records = export_generator.filter_by_preset(records, export_type)
+                    period_desc = {'day': 'Last 24 hours', 'week': 'Last 7 days', 'month': 'Last 30 days'}[export_type]
+                
+                if not filtered_records:
+                    await say(f"No mentions found for: {period_desc}")
+                    return
+                
+                try:
+                    # Generate files
+                    csv_bytes = export_generator.generate_csv_bytes(filtered_records)
+                    xlsx_bytes = export_generator.generate_xlsx_bytes(filtered_records)
+                    
+                    # Get stats
+                    stats = export_generator.get_export_stats(filtered_records)
+                    csv_size = export_generator.get_file_size_str(len(csv_bytes))
+                    xlsx_size = export_generator.get_file_size_str(len(xlsx_bytes))
+                    
+                    # Send message
+                    group_name = bot_self.groups.get(group_id, {}).get('name', f'Group {group_id}')
+                    msg = (
+                        f"Export Complete!\n\n"
+                        f"Period: {period_desc}\n"
+                        f"Mentions: {stats['mentions']}\n"
+                        f"Context Comments: {stats['context_comments']}\n"
+                        f"Total Rows: {stats['total_rows']}\n\n"
+                        f"CSV: {csv_size}\n"
+                        f"XLSX: {xlsx_size}"
+                    )
+                    await say(msg)
+                    
+                    # Upload files
+                    from datetime import datetime
+                    timestamp = datetime.now().strftime('%Y-%m-%d')
+                    
+                    await client.files_upload_v2(
+                        channel=channel,
+                        content=csv_bytes.decode('utf-8'),
+                        filename=f"mentions_export_{timestamp}.csv",
+                        title="Mentions Export (CSV)"
+                    )
+                    
+                    await client.files_upload_v2(
+                        channel=channel,
+                        file=xlsx_bytes,
+                        filename=f"mentions_export_{timestamp}.xlsx",
+                        title="Mentions Export (Excel)"
+                    )
+                    
+                    logger.info(f"Slack export completed for group {group_id}: {stats['total_rows']} rows")
+                    
+                except Exception as e:
+                    logger.error(f"Error generating Slack export: {e}")
+                    await say(f"Error generating export: {e}")
+            
+            # Create Socket Mode handler
+            handler = AsyncSocketModeHandler(slack_app, self.slack_app_token)
+            logger.info("Slack Socket Mode configured")
+            return handler
+            
+        except Exception as e:
+            logger.error(f"Failed to set up Slack Socket Mode: {e}")
+            return None
     
     def save_data(self):
         """Save groups, keywords and processed items to environment variable and file"""
@@ -3045,6 +3202,12 @@ For other assistance, please contact the bot owner.
         await app.updater.start_polling()
         
         logger.info("Telegram bot started")
+        
+        # Start Slack Socket Mode (for receiving messages in Slack)
+        slack_socket_handler = await self.setup_slack_socket_mode()
+        if slack_socket_handler:
+            asyncio.create_task(slack_socket_handler.start_async())
+            logger.info("Slack Socket Mode started")
         
         # Start notification processor in background
         self.notification_task = asyncio.create_task(self.notification_processor())
