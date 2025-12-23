@@ -3042,6 +3042,240 @@ class RedditTelegramBot:
             logger.error(f"Error generating export: {e}")
             await update.message.reply_text(f"Error generating export: {e}")
     
+    async def backfill_mentions(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Backfill mention history by re-searching Reddit for past keywords.
+        Owner-only command. Sends progress updates to the target client group.
+        
+        Commands:
+        /backfill <group_id> all - Search all available history
+        /backfill <group_id> month - Last 30 days (default)
+        /backfill <group_id> 2 - Last 2 months
+        /backfill <group_id> 3 - Last 3 months
+        """
+        chat_id = update.effective_chat.id
+        
+        # Owner-only command
+        if not self.is_owner(chat_id):
+            await update.message.reply_text("This command is only available to the bot owner.")
+            return
+        
+        args = list(context.args) if context.args else []
+        
+        # Require group_id
+        if not args or not (args[0].startswith('-') or args[0].isdigit()):
+            await update.message.reply_text(
+                "Usage: /backfill <group_id> [period]\n\n"
+                "Periods:\n"
+                "  month - Last 30 days (default)\n"
+                "  all - All available history (~1 year)\n"
+                "  2 - Last 2 months\n"
+                "  3 - Last 3 months\n\n"
+                "Example: /backfill -123456789 2"
+            )
+            return
+        
+        try:
+            group_id = int(args[0])
+            if group_id not in self.groups:
+                await update.message.reply_text(f"Group {group_id} not found. Use /listgroups to see available groups.")
+                return
+            args = args[1:]  # Remove group_id from args
+        except ValueError:
+            await update.message.reply_text("Invalid group ID.")
+            return
+        
+        # Parse time period
+        args = list(context.args) if context.args else []
+        # Remove group_id if it was the first arg
+        if args and (args[0].startswith('-') or args[0].isdigit()):
+            try:
+                int(args[0])
+                args = args[1:]
+            except ValueError:
+                pass
+        
+        period = args[0].lower() if args else 'month'
+        
+        # Determine date limit
+        days_limit = 30  # Default: 1 month
+        if period == 'all':
+            days_limit = 365  # Reddit search limit is roughly 1 year
+        elif period == 'month':
+            days_limit = 30
+        elif period == 'week':
+            days_limit = 7
+        elif period.isdigit():
+            days_limit = int(period) * 30  # Number = months
+        
+        group_info = self.groups.get(group_id, {})
+        group_name = group_info.get('name', f'Group {group_id}')
+        keywords = group_info.get('keywords', set())
+        cs_keywords = group_info.get('case_sensitive_keywords', set())
+        all_keywords = keywords | cs_keywords
+        
+        if not all_keywords:
+            await update.message.reply_text(f"No keywords configured for {group_name}.")
+            return
+        
+        await update.message.reply_text(
+            f"Starting backfill for {group_name}...\n\n"
+            f"Keywords: {len(all_keywords)}\n"
+            f"Period: Last {days_limit} days\n\n"
+            f"This may take several minutes. You'll be notified when complete."
+        )
+        
+        # Send notification to client group
+        await self._send_platform_message(
+            group_id,
+            f"[System] Backfilling historical data...\n\n"
+            f"Scanning Reddit for past {days_limit} days.\n"
+            f"Keywords: {len(all_keywords)}\n\n"
+            f"This process runs in the background."
+        )
+        
+        # Track stats
+        total_posts = 0
+        total_comments = 0
+        already_stored = 0
+        
+        try:
+            if not self.reddit:
+                await self.setup_reddit()
+            
+            # Get existing item IDs to avoid duplicates
+            existing_ids = set()
+            for record in self.mention_history.get(group_id, []):
+                url = record.get('url', '')
+                if url:
+                    # Extract ID from URL
+                    parts = url.split('/')
+                    for i, part in enumerate(parts):
+                        if part in ('comments', 'comment'):
+                            if i + 1 < len(parts):
+                                existing_ids.add(parts[i + 1])
+            
+            subreddit = await self.reddit.subreddit('all')
+            
+            for keyword in all_keywords:
+                try:
+                    logger.info(f"Backfill: Searching for '{keyword}'")
+                    
+                    # Search posts
+                    async for post in subreddit.search(
+                        query=f'"{keyword}"',
+                        sort='new',
+                        time_filter='year' if days_limit > 30 else 'month',
+                        limit=100
+                    ):
+                        # Check date
+                        post_date = datetime.fromtimestamp(post.created_utc)
+                        if (datetime.now() - post_date).days > days_limit:
+                            continue
+                        
+                        # Skip if already stored
+                        if post.id in existing_ids:
+                            already_stored += 1
+                            continue
+                        
+                        # Verify keyword match
+                        title_lower = post.title.lower()
+                        body_lower = (post.selftext or '').lower()
+                        keyword_lower = keyword.lower()
+                        
+                        if keyword_lower in title_lower or keyword_lower in body_lower:
+                            # Check subreddit filters
+                            sub_name = post.subreddit.display_name.lower()
+                            allowed_subs = group_info.get('subreddits', set())
+                            blacklist = group_info.get('subreddit_blacklist', set())
+                            
+                            if blacklist and sub_name in blacklist:
+                                continue
+                            if allowed_subs and sub_name not in {s.lower() for s in allowed_subs}:
+                                continue
+                            
+                            # Store the mention
+                            self.store_mention(group_id, post, keyword, 'post')
+                            existing_ids.add(post.id)
+                            total_posts += 1
+                            
+                            # Fetch context comments
+                            await self.fetch_and_store_context_comments(group_id, post, keyword)
+                    
+                    # Search comments
+                    async for submission in subreddit.search(
+                        query=f'"{keyword}"',
+                        sort='comments',
+                        time_filter='year' if days_limit > 30 else 'month',
+                        limit=50
+                    ):
+                        try:
+                            submission.comment_sort = 'new'
+                            comments = await submission.comments()
+                            await comments.replace_more(limit=0)
+                            
+                            for comment in comments.list()[:50]:
+                                # Check date
+                                comment_date = datetime.fromtimestamp(comment.created_utc)
+                                if (datetime.now() - comment_date).days > days_limit:
+                                    continue
+                                
+                                if comment.id in existing_ids:
+                                    already_stored += 1
+                                    continue
+                                
+                                body_lower = (comment.body or '').lower()
+                                if keyword_lower in body_lower:
+                                    # Check subreddit filters
+                                    sub_name = comment.subreddit.display_name.lower()
+                                    if blacklist and sub_name in blacklist:
+                                        continue
+                                    if allowed_subs and sub_name not in {s.lower() for s in allowed_subs}:
+                                        continue
+                                    
+                                    self.store_mention(group_id, comment, keyword, 'comment')
+                                    existing_ids.add(comment.id)
+                                    total_comments += 1
+                        except Exception as e:
+                            logger.debug(f"Error processing comments: {e}")
+                            continue
+                    
+                    # Rate limiting
+                    await asyncio.sleep(2)
+                    
+                except Exception as e:
+                    logger.error(f"Backfill error for keyword '{keyword}': {e}")
+                    continue
+            
+            # Save the updated data
+            self.save_data()
+            
+            # Report results
+            result_msg = (
+                f"Backfill Complete for {group_name}!\n\n"
+                f"Posts found: {total_posts}\n"
+                f"Comments found: {total_comments}\n"
+                f"Already existed: {already_stored}\n"
+                f"Total new records: {total_posts + total_comments}\n\n"
+                f"Use /export all to download the data."
+            )
+            await update.message.reply_text(result_msg)
+            
+            # Send completion notification to client group
+            await self._send_platform_message(
+                group_id,
+                f"[System] Historical data backfill complete!\n\n"
+                f"Records added: {total_posts + total_comments}\n"
+                f"  - Posts: {total_posts}\n"
+                f"  - Comments: {total_comments}\n\n"
+                f"Use 'export all' to download your complete data."
+            )
+            
+            logger.info(f"Backfill completed for group {group_id}: {total_posts} posts, {total_comments} comments")
+            
+        except Exception as e:
+            logger.error(f"Backfill error: {e}")
+            await update.message.reply_text(f"Backfill error: {e}")
+    
     async def help_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Show help message"""
         chat_id = update.effective_chat.id
@@ -3186,6 +3420,7 @@ For other assistance, please contact the bot owner.
         app.add_handler(CommandHandler("exportdata", self.export_data))
         app.add_handler(CommandHandler("export", self.export_mentions))
         app.add_handler(CommandHandler("broadcast", self.broadcast))
+        app.add_handler(CommandHandler("backfill", self.backfill_mentions))
         app.add_handler(CommandHandler("help", self.help_command))
         app.add_handler(CommandHandler("start", self.help_command))
         
