@@ -3061,28 +3061,46 @@ class RedditTelegramBot:
         
         args = list(context.args) if context.args else []
         
-        # Require group_id
-        if not args or not (args[0].startswith('-') or args[0].isdigit()):
+        # Require group_id or channel_id
+        if not args:
             await update.message.reply_text(
                 "Usage: /backfill <group_id> [period]\n\n"
+                "group_id can be:\n"
+                "  - Numeric group ID (e.g., -123456789)\n"
+                "  - Slack channel ID (e.g., C09S409SU4W)\n\n"
                 "Periods:\n"
                 "  month - Last 30 days (default)\n"
                 "  all - All available history (~1 year)\n"
                 "  2 - Last 2 months\n"
                 "  3 - Last 3 months\n\n"
-                "Example: /backfill -123456789 2"
+                "Example: /backfill C09S409SU4W 2"
             )
             return
         
+        # Try to find the group - could be numeric ID or Slack channel ID
+        group_id = None
+        identifier = args[0]
+        
+        # First try as numeric group ID
         try:
-            group_id = int(args[0])
-            if group_id not in self.groups:
-                await update.message.reply_text(f"Group {group_id} not found. Use /listgroups to see available groups.")
-                return
-            args = args[1:]  # Remove group_id from args
+            potential_id = int(identifier)
+            if potential_id in self.groups:
+                group_id = potential_id
         except ValueError:
-            await update.message.reply_text("Invalid group ID.")
+            pass
+        
+        # If not found, try as Slack channel ID
+        if group_id is None:
+            for gid, ginfo in self.groups.items():
+                if ginfo.get('channel_id') == identifier:
+                    group_id = gid
+                    break
+        
+        if group_id is None:
+            await update.message.reply_text(f"Group '{identifier}' not found. Use /listgroups to see available groups.")
             return
+        
+        args = args[1:]  # Remove group_id from args
         
         # Parse time period
         args = list(context.args) if context.args else []
