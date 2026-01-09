@@ -1474,7 +1474,11 @@ class RedditTelegramBot:
         """Select a group to manage via interactive menu (Owner only)"""
         chat_id = update.effective_chat.id
         
+        # Debug logging for permission issues
+        logger.info(f"Received /group command from chat_id: {chat_id}, expected owner_chat_id: {self.owner_chat_id}")
+        
         if not self.is_owner(chat_id):
+            logger.warning(f"Permission denied for /group: chat_id={chat_id}, owner_chat_id={self.owner_chat_id}")
             await update.message.reply_text("You don't have permission to use this command. Please contact the bot owner.")
             return
         
@@ -3324,6 +3328,9 @@ class RedditTelegramBot:
     async def help_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Show help message"""
         chat_id = update.effective_chat.id
+        
+        # Debug logging
+        logger.info(f"Received /help or /start command from chat_id: {chat_id}, owner_chat_id: {self.owner_chat_id}")
         
         if self.is_owner(chat_id):
             # Full help for owner
