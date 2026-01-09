@@ -707,8 +707,8 @@ class RedditTelegramBot:
         
         logger.info("Notification processor stopped")
     
-    async def _send_telegram_message(self, chat_id: int, message: str):
-        """Send a single message to Telegram"""
+    async def _send_telegram_message(self, chat_id: int, message: str, original_group_id: int = None):
+        """Send a single message to Telegram with auto-migration support"""
         try:
             if not self.telegram_session or self.telegram_session.closed:
                 timeout = aiohttp.ClientTimeout(total=30)
@@ -732,6 +732,33 @@ class RedditTelegramBot:
                             response_text = await retry_response.text()
                             logger.error(f"Failed to send notification after retry: {response_text}")
                             raise Exception(f"Telegram API error: {response_text}")
+                elif response.status == 400:
+                    response_json = await response.json()
+                    # Check for group migration to supergroup
+                    if 'migrate_to_chat_id' in response_json.get('parameters', {}):
+                        new_chat_id = response_json['parameters']['migrate_to_chat_id']
+                        logger.warning(f"Group {chat_id} migrated to supergroup {new_chat_id}. Auto-migrating...")
+                        
+                        # Update the group's channel_id if we know which group this is
+                        if original_group_id and original_group_id in self.groups:
+                            self.groups[original_group_id]['channel_id'] = str(new_chat_id)
+                            self.save_data()
+                            logger.info(f"Updated group {original_group_id} channel_id to {new_chat_id}")
+                        
+                        # Retry with the new chat ID
+                        data['chat_id'] = new_chat_id
+                        async with self.telegram_session.post(url, data=data) as retry_response:
+                            if retry_response.status != 200:
+                                response_text = await retry_response.text()
+                                logger.error(f"Failed to send notification after migration: {response_text}")
+                                raise Exception(f"Telegram API error: {response_text}")
+                            else:
+                                logger.info(f"Successfully sent notification to migrated group {new_chat_id}")
+                                return  # Success after migration
+                    else:
+                        response_text = await response.text()
+                        logger.error(f"Failed to send notification: {response_text}")
+                        raise Exception(f"Telegram API error: {response_text}")
                 elif response.status != 200:
                     response_text = await response.text()
                     logger.error(f"Failed to send notification: {response_text}")
@@ -782,7 +809,7 @@ class RedditTelegramBot:
             workspace_id = group_info.get('workspace_id', '')
             await self._send_slack_message(workspace_id, channel_id, message)
         else:  # Default to telegram
-            await self._send_telegram_message(int(channel_id), message)
+            await self._send_telegram_message(int(channel_id), message, original_group_id=group_id)
 
     async def rate_limit_reddit_request(self):
         """Ensure proper spacing between Reddit API requests"""
