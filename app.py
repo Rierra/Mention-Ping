@@ -3163,7 +3163,15 @@ class RedditTelegramBot:
         all_keywords = keywords | cs_keywords
         
         if not all_keywords:
-            await update.message.reply_text(f"No keywords configured for {group_name}.")
+            # DEBUG: Print what we actually found
+            debug_info = (
+                f"DEBUG INFO:\n"
+                f"Group ID: {group_id} (type: {type(group_id)})\n"
+                f"Group Name: {group_name}\n"
+                f"Keys in groups: {list(self.groups.keys())[:5]}...\n"
+                f"Group Data: {self.groups.get(group_id, 'Not Found')}"
+            )
+            await update.message.reply_text(f"No keywords configured for {group_name}.\n\n{debug_info}")
             return
         
         await update.message.reply_text(
